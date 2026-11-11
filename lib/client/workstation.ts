@@ -1,5 +1,7 @@
 "use client";
 
+import { clientUuid } from "@/lib/client/uuid";
+
 import { useSyncExternalStore } from "react";
 
 /**
@@ -13,7 +15,7 @@ export function getWorkstationId(): string | null {
   try {
     let id = window.localStorage.getItem(KEY);
     if (!id || !/^[0-9a-f-]{36}$/i.test(id)) {
-      id = crypto.randomUUID();
+      id = clientUuid();
       window.localStorage.setItem(KEY, id);
     }
     return id;

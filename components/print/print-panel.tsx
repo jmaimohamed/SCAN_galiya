@@ -1,5 +1,7 @@
 "use client";
 
+import { clientUuid } from "@/lib/client/uuid";
+
 import * as React from "react";
 import Link from "next/link";
 import { FileText, Printer, RefreshCw, RotateCcw, TriangleAlert } from "lucide-react";
@@ -109,7 +111,7 @@ export function PrintPanel({ reportId, blockedReason = null, replacesReference =
     inFlight.current = true;
     setBusy(true);
     setMessage({ tone: "info", text: "Préparation de l'étiquette…" });
-    if (!pendingKey.current || pendingKey.current.kind !== kind) pendingKey.current = { kind, key: crypto.randomUUID() };
+    if (!pendingKey.current || pendingKey.current.kind !== kind) pendingKey.current = { kind, key: clientUuid() };
     try {
       const { job, replayed } = await apiFetch<{ job: PrintJobDto; replayed: boolean }>("/api/print-jobs", {
         body: { idempotencyKey: pendingKey.current.key, kind, reportId, workstationId, reprintReason },

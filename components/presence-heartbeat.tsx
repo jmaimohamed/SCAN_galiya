@@ -1,4 +1,6 @@
 "use client";
+
+import { clientUuid } from "@/lib/client/uuid";
 import { useEffect } from "react";
 import { apiFetch } from "@/lib/client/api";
 import { getWorkstationId } from "@/lib/client/workstation";
@@ -6,7 +8,7 @@ import { getWorkstationId } from "@/lib/client/workstation";
 /** One ephemeral ID per mounted browser tab; no close event can log out another tab. */
 export function PresenceHeartbeat() {
   useEffect(() => {
-    const tabId = crypto.randomUUID();
+    const tabId = clientUuid();
     let boxId: string | null = null;
     let activity = true;
     let sending = false;

@@ -1,3 +1,5 @@
+import { clientUuid } from "@/lib/client/uuid";
+
 /**
  * Ordered scan queue.
  *
@@ -45,7 +47,7 @@ export class ScanQueue<R> {
 
   enqueue(raw: string): ScanJob<R> {
     const job: ScanJob<R> = {
-      key: (this.opts.makeKey ?? (() => crypto.randomUUID()))(),
+      key: (this.opts.makeKey ?? (() => clientUuid()))(),
       raw,
       seq: ++this.seq,
       status: "queued",

@@ -1,5 +1,7 @@
 "use client";
 
+import { clientUuid } from "@/lib/client/uuid";
+
 import * as React from "react";
 import { CheckCircle2, CircleAlert, Printer, Save, ShieldCheck } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -76,7 +78,7 @@ export function PrinterSettings() {
     if (!ws || busy || inFlight.current) return;
     inFlight.current = true;
     setBusy(true);
-    testKey.current ??= crypto.randomUUID();
+    testKey.current ??= clientUuid();
     try {
       const { job } = await apiFetch<{ job: PrintJobDto }>("/api/print-jobs", {
         body: { idempotencyKey: testKey.current, kind: "TEST", reportId: null, workstationId: ws, reprintReason: null },
