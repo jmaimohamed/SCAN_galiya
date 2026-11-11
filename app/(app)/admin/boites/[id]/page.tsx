@@ -1,0 +1,27 @@
+import Link from "next/link";
+import { requirePageActor } from "@/lib/server/auth/current";
+import { parseId } from "@/lib/server/schemas";
+import { getBoxDetail } from "@/lib/server/services/history";
+import { AdminBoxActions } from "@/components/admin/box-actions";
+import { formatDateTime } from "@/lib/time";
+export default async function AdminBoxPage({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<Record<string, string | undefined>> }) {
+  await requirePageActor("ADMIN");
+  const sp = await searchParams;
+  const pages = Object.fromEntries(["items", "attempts", "rejections", "events", "generations"].map((key) => [key, Math.max(1, parseInt(sp[key] ?? "1", 10) || 1)]));
+  const b = await getBoxDetail(parseId((await params).id), pages);
+  const pagination = (key: keyof typeof b.totals) => {
+    const page = pages[key]; const count = Math.max(1, Math.ceil(b.totals[key] / 25));
+    const href = (n: number) => `?${new URLSearchParams({ ...sp, [key]: String(n) } as Record<string, string>)}#${key}`;
+    return <nav className="my-3 flex gap-4 text-sm"><span>Page {page}/{count} · {b.totals[key]} enregistrements</span>{page > 1 && <Link className="underline" href={href(page - 1)}>Précédente</Link>}{page < count && <Link className="underline" href={href(page + 1)}>Suivante</Link>}</nav>;
+  };
+  return <article className="flex flex-col gap-5">
+    <h1 className="text-3xl font-black">Boîte {b.boxSerial} — {b.needsRecontrol ? "À recontrôler" : b.correctionActive ? "Correction en cours" : b.status}</h1>
+    <div className="rounded-lg border-2 bg-card p-4"><p className="break-all font-mono text-lg">{b.galiaPayload}</p><p>PN <b>{b.partNumber}</b> · quantité active <b>{b.acceptedQty}/{b.expectedQty}</b> · génération <b>{b.generation}</b> · responsable actuel {b.currentOwner ?? "—"}</p><p>Créée par {b.createdBy} le {formatDateTime(b.createdAt)}</p><p>Note : {b.notes ?? "—"}</p></div>
+    <p className="rounded-md border-2 border-warn bg-warn-soft p-3 font-bold">Retirer les étiquettes obsolètes après toute invalidation. Le logiciel ne peut pas rappeler une étiquette déjà imprimée.</p><AdminBoxActions box={b} />
+    <section id="generations"><h2 className="text-2xl font-bold">Générations courantes et archivées</h2>{pagination("generations")}{b.generations.map((g) => <div className="my-2 rounded-md border bg-card p-3" key={g.number}><b>Génération {g.number} — {g.voidedAt ? "ARCHIVÉE" : "Courante"}</b><p className="break-all font-mono">{g.galiaPayload}</p><p>PN {g.partNumber} · série {g.boxSerial} · quantité prévue {g.expectedQty} · début {formatDateTime(g.startedAt)}</p>{g.voidedAt && <p>Annulée par {g.voidedBy} le {formatDateTime(g.voidedAt)} : {g.voidReason}</p>}</div>)}</section>
+    <section id="items" className="overflow-x-auto"><h2 className="text-2xl font-bold">Coiffes acceptées et annulées</h2>{pagination("items")}<table className="w-full text-left"><thead><tr><th>PN / série</th><th>Génération / tentative</th><th>Acceptée par / date</th><th>État / motif</th><th>Action admin</th></tr></thead><tbody>{b.items.map((i) => <tr className="border-t" key={i.id}><td className="py-3 font-mono">{i.partNumber}<br />{i.serial}</td><td>{i.generation} / {i.attemptNumber}</td><td>{i.acceptedBy}<br />{formatDateTime(i.acceptedAt)}</td><td>{i.voidedAt ? `Annulée le ${formatDateTime(i.voidedAt)} : ${i.voidReason}` : "Active"}</td><td><AdminBoxActions box={b} item={i} /></td></tr>)}</tbody></table></section>
+    <section id="attempts"><h2 className="text-2xl font-bold">Contrôles, corrections, rapports et impressions</h2>{pagination("attempts")}{b.attempts.map((a) => <div className="my-3 rounded-md border-2 bg-card p-4" key={a.id}><h3 className="font-bold">Génération {a.generation} / tentative {a.number} · {a.administrativeRecontrol ? "Recontrôle administratif" : a.kind === "CORRECTION" ? "Correction NOT OK" : "Contrôle initial"} · {a.voidedAt ? "ARCHIVÉE" : a.status}</h3><p>{a.startedBy} · {formatDateTime(a.startedAt)} · {a.acceptedInAttempt} acceptations historiques</p>{a.report && <><p>Rapport {a.report.reference} · {a.report.result} · {a.report.acceptedQty}/{a.report.expectedQty} · finalisé par {a.report.finalizedBy} le {formatDateTime(a.report.finalizedAt)}</p><p>{a.printable ? "Résultat courant valide" : "Historique : aucune nouvelle impression de production"}</p><Link className="underline" href={`/admin/rapports/${a.report.id}`}>Rapport et historique complet des impressions</Link></>}{a.printJobs.map((j) => <p key={j.id}><Link className="underline" href={`/admin/etiquettes/${j.id}`}>Snapshot {j.type} · {formatDateTime(j.createdAt)}</Link> · {j.requestedBy} · {j.workstationName} · {j.status} (sortie non confirmée)</p>)}</div>)}</section>
+    <section id="rejections"><h2 className="text-2xl font-bold">Scans refusés</h2>{pagination("rejections")}{b.rejections.map((r) => <p className="border-t py-2" key={r.id}>{formatDateTime(r.createdAt)} · {r.username} · tentative {r.attemptNumber} · <b>{r.title}</b> · {r.message}<br /><code>{r.raw}</code></p>)}</section>
+    <section id="events"><h2 className="text-2xl font-bold">Audit et modifications administratives</h2>{pagination("events")}{b.events.map((e) => <details className="border-t py-2" key={e.id}><summary>{formatDateTime(e.createdAt)} · {e.username ?? "Système"} · {e.type}</summary><pre className="overflow-x-auto whitespace-pre-wrap text-sm">{JSON.stringify(e.details, null, 2)}</pre></details>)}</section>
+  </article>;
+}

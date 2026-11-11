@@ -1,0 +1,11 @@
+import Link from "next/link";
+import { requirePageActor } from "@/lib/server/auth/current";
+import { presencePage } from "@/lib/server/services/presence";
+import { AdminAutoRefresh } from "@/components/admin/auto-refresh";
+import { formatDateTime } from "@/lib/time";
+export default async function PresencePage({ searchParams }: { searchParams: Promise<{ state?: string; page?: string }> }) {
+  const actor = await requirePageActor("ADMIN");
+  const sp = await searchParams;
+  const { rows, page, pageCount } = await presencePage(actor, { state: sp.state, page: parseInt(sp.page ?? "1", 10) || 1 });
+  return <section className="flex flex-col gap-4"><h1 className="text-3xl font-bold">Présence des opérateurs</h1><AdminAutoRefresh /><p>Signal toutes les 20 s. En ligne : signal reçu depuis moins de 75 s et activité récente. Inactif : signaux récents mais aucune interaction depuis 2 min. Hors ligne : signal expiré. Les sessions expirées/révoquées et comptes désactivés sont exclus. Les onglets sont regroupés par opérateur et poste : fermer un onglet ne ferme pas les autres. Historique de présence limité aux dernières 24 h.</p><nav className="flex gap-4">{[["", "Tous"], ["ACTIVE", "Connectés"], ["ONLINE", "En ligne"], ["IDLE", "Inactifs"], ["OFFLINE", "Hors ligne"]].map(([state, label]) => <Link className="underline" key={state} href={`/admin/presence?state=${state}`}>{label}</Link>)}</nav><table className="w-full text-left"><thead><tr><th>Opérateur</th><th>Poste</th><th>Boîte active</th><th>Dernière activité</th><th>Dernier signal</th><th>État</th></tr></thead><tbody>{rows.map((r, i) => <tr className="border-t" key={`${r.username}-${i}`}><td className="py-3 font-bold">{r.username}</td><td>{r.workstation ?? "Poste non nommé"}</td><td>{r.boxSerial ?? "—"}</td><td>{formatDateTime(r.lastActivity)}</td><td>{formatDateTime(r.lastHeartbeat)}</td><td>{{ ONLINE: "En ligne", IDLE: "Inactif", OFFLINE: "Hors ligne" }[r.state]}</td></tr>)}</tbody></table><nav className="flex gap-4">Page {page}/{pageCount}{page > 1 && <Link href={`?state=${sp.state ?? ""}&page=${page - 1}`}>Précédente</Link>}{page < pageCount && <Link href={`?state=${sp.state ?? ""}&page=${page + 1}`}>Suivante</Link>}</nav></section>;
+}

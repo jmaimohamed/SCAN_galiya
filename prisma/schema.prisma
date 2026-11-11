@@ -1,0 +1,390 @@
+// GALIA Control — PostgreSQL schema.
+// All timestamps are stored as timestamptz (UTC). The UI displays them in Africa/Tunis.
+// Extra integrity rules that Prisma cannot express (immutability triggers, CHECK
+// constraints, the per-box quantity guard) live in the SQL migrations.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  OPERATOR
+  ADMIN
+}
+
+enum BoxStatus {
+  IN_PROGRESS
+  OK
+  NOK
+}
+
+enum ScanOutcome {
+  ACCEPTED
+  INVALID_FORMAT
+  WRONG_PART_NUMBER
+  DUPLICATE_SAME_BOX
+  DUPLICATE_OTHER_BOX
+  QUANTITY_REACHED
+  BOX_NOT_IN_PROGRESS
+  NOT_BOX_OWNER
+}
+
+/// INITIAL = first control of a box; CORRECTION = reopening of a NOT OK box to add missing covers.
+enum AttemptKind {
+  INITIAL
+  CORRECTION
+}
+
+enum AttemptStatus {
+  IN_PROGRESS
+  FINALIZED
+}
+
+enum PrintJobType {
+  ORIGINAL
+  REPRINT
+  TEST
+}
+
+/// CREATED … UNKNOWN: legacy direct (Browser Print) jobs.
+/// DIALOG_REQUESTED: immutable label saved for an unconfirmed browser print request.
+/// Final state; neither dialog display nor physical output can be verified.
+enum PrintJobStatus {
+  CREATED
+  DISPATCHING
+  SENT_TO_PRINTER
+  FAILED
+  UNKNOWN
+  DIALOG_REQUESTED
+}
+
+model User {
+  id           String    @id @default(uuid()) @db.Uuid
+  /// "Identifiant utilisateur" — stored upper-case, unique.
+  username     String    @unique @db.VarChar(32)
+  displayName  String?   @db.VarChar(80)
+  passwordHash String
+  role         Role      @default(OPERATOR)
+  active       Boolean   @default(true)
+  createdAt    DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime  @updatedAt @db.Timestamptz(3)
+  lastLoginAt  DateTime? @db.Timestamptz(3)
+
+  sessions        Session[]
+  boxesCreated    Box[]            @relation("BoxCreatedBy")
+  boxesFinalized  Box[]            @relation("BoxFinalizedBy")
+  itemsAccepted   AcceptedItem[]
+  scanAttempts    ScanAttempt[]
+  reports         Report[]
+  printJobs       PrintJob[]
+  controlAttempts ControlAttempt[]
+}
+
+model Session {
+  /// SHA-256 (hex) of the random cookie token. The raw token is never stored.
+  id         String    @id @db.Char(64)
+  userId     String    @db.Uuid
+  user       User      @relation(fields: [userId], references: [id])
+  createdAt  DateTime  @default(now()) @db.Timestamptz(3)
+  lastSeenAt DateTime  @default(now()) @db.Timestamptz(3)
+  expiresAt  DateTime  @db.Timestamptz(3)
+  revokedAt  DateTime? @db.Timestamptz(3)
+  ip         String?   @db.VarChar(64)
+  userAgent  String?   @db.VarChar(256)
+
+  @@index([userId])
+}
+
+model LoginAttempt {
+  id        BigInt   @id @default(autoincrement())
+  username  String   @db.VarChar(64)
+  ip        String   @db.VarChar(64)
+  success   Boolean
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([username, createdAt])
+  @@index([ip, createdAt])
+}
+
+model Box {
+  id             String    @id @default(uuid()) @db.Uuid
+  generation     Int       @default(1)
+  generationStartedAt DateTime @default(now()) @db.Timestamptz(3)
+  needsRecontrol Boolean   @default(false)
+  currentReportId String?  @db.Uuid
+  notes          String?   @db.VarChar(500)
+  boxSerial      String    @unique @db.VarChar(30)
+  partNumber     String    @db.VarChar(40)
+  expectedQty    Int
+  /// Exact GALIA payload as scanned, minus surrounding transport whitespace (CR/LF).
+  /// This is the content reproduced in the OK label QR code.
+  galiaPayload   String    @db.VarChar(128)
+  /// IN_PROGRESS until the first finalization, then the LATEST finalized result (OK / NOK).
+  /// A NOK box under correction keeps NOK here and has an open `activeAttemptId`.
+  status         BoxStatus @default(IN_PROGRESS)
+  /// The open control/correction attempt; null when the box is closed.
+  activeAttemptId String?         @unique @db.Uuid
+  activeAttempt   ControlAttempt? @relation("BoxActiveAttempt", fields: [activeAttemptId], references: [id])
+  createdById    String    @db.Uuid
+  createdBy      User      @relation("BoxCreatedBy", fields: [createdById], references: [id])
+  createdAt      DateTime  @default(now()) @db.Timestamptz(3)
+
+  /// Active-box ownership lease (one controlling session/tab at a time).
+  ownerUserId    String?   @db.Uuid
+  ownerSessionId String?   @db.Char(64)
+  leaseTokenHash String?   @db.Char(64)
+  ownerSince     DateTime? @db.Timestamptz(3)
+
+  finalizedAt    DateTime? @db.Timestamptz(3)
+  finalizedById  String?   @db.Uuid
+  finalizedBy    User?     @relation("BoxFinalizedBy", fields: [finalizedById], references: [id])
+
+  items           AcceptedItem[]
+  scanAttempts    ScanAttempt[]
+  controlAttempts ControlAttempt[] @relation("BoxControlAttempts")
+  reports         Report[]
+  generations     ControlGeneration[]
+  reservations    ActiveSerialReservation[]
+
+  @@index([createdAt])
+  @@index([status, createdAt])
+  @@index([partNumber])
+  @@index([ownerUserId])
+  @@index([needsRecontrol, finalizedAt])
+  @@index([generationStartedAt])
+  @@index([finalizedAt])
+}
+
+model ControlGeneration {
+  id           String @id @default(uuid()) @db.Uuid
+  boxId        String @db.Uuid
+  box          Box @relation(fields: [boxId], references: [id])
+  number       Int
+  partNumber   String @db.VarChar(40)
+  boxSerial    String @db.VarChar(30)
+  expectedQty  Int
+  galiaPayload String @db.VarChar(128)
+  startedAt    DateTime @default(now()) @db.Timestamptz(3)
+  voidedAt     DateTime? @db.Timestamptz(3)
+  voidedById   String? @db.Uuid
+  voidReason   String? @db.VarChar(500)
+  @@unique([boxId, number])
+  @@index([voidedAt])
+}
+
+/// One control session of a box: the initial control (#1) or a correction (#2, #3…).
+/// Accepted items stay with the box (cumulative); each finalized attempt has one immutable Report.
+model ControlAttempt {
+  id               String        @id @default(uuid()) @db.Uuid
+  boxId            String        @db.Uuid
+  box              Box           @relation("BoxControlAttempts", fields: [boxId], references: [id])
+  number           Int
+  generation       Int @default(1)
+  administrativeRecontrol Boolean @default(false)
+  voidedAt         DateTime? @db.Timestamptz(3)
+  kind             AttemptKind
+  status           AttemptStatus @default(IN_PROGRESS)
+  startedById      String        @db.Uuid
+  startedBy        User          @relation(fields: [startedById], references: [id])
+  startedAt        DateTime      @default(now()) @db.Timestamptz(3)
+  finalizedAt      DateTime?     @db.Timestamptz(3)
+  /// For a correction: the NOT OK report it starts from.
+  previousReportId String?       @db.Uuid
+  previousReport   Report?       @relation("AttemptPreviousReport", fields: [previousReportId], references: [id])
+
+  activeFor Box?           @relation("BoxActiveAttempt")
+  items     AcceptedItem[]
+  scans     ScanAttempt[]
+  report    Report?        @relation("AttemptReport")
+
+  @@unique([boxId, number])
+  @@index([boxId, generation])
+}
+
+model ScanAttempt {
+  id             String      @id @default(uuid()) @db.Uuid
+  /// Client-generated key for one logical scan; retries reuse it.
+  idempotencyKey String      @unique @db.Uuid
+  /// SHA-256 of (boxId, raw payload). A reused key with another payload is rejected.
+  requestHash    String      @db.Char(64)
+  boxId          String      @db.Uuid
+  generation     Int         @default(1)
+  box            Box         @relation(fields: [boxId], references: [id])
+  /// Attempt that was open when the scan arrived (null if the box was closed).
+  controlAttemptId String?         @db.Uuid
+  controlAttempt   ControlAttempt? @relation(fields: [controlAttemptId], references: [id])
+  userId         String      @db.Uuid
+  user           User        @relation(fields: [userId], references: [id])
+  sessionId      String      @db.Char(64)
+  /// Bounded raw payload (first 160 characters); rawLength keeps the true length.
+  rawPayload     String      @db.VarChar(160)
+  rawLength      Int
+  partNumber     String?     @db.VarChar(40)
+  serial         String?     @db.VarChar(30)
+  outcome        ScanOutcome
+  errorCode      String?     @db.VarChar(40)
+  detail         Json?
+  createdAt      DateTime    @default(now()) @db.Timestamptz(3)
+
+  acceptedItem AcceptedItem?
+
+  @@index([boxId, createdAt])
+  @@index([serial])
+}
+
+model AcceptedItem {
+  id           String      @id @default(uuid()) @db.Uuid
+  /// History is retained; only ActiveSerialReservation enforces active uniqueness.
+  serial       String      @db.VarChar(30)
+  generation   Int         @default(1)
+  voidedAt     DateTime?    @db.Timestamptz(3)
+  voidedById   String?      @db.Uuid
+  voidReason   String?      @db.VarChar(500)
+  reservation  ActiveSerialReservation?
+  partNumber   String      @db.VarChar(40)
+  rawPayload   String      @db.VarChar(128)
+  boxId        String      @db.Uuid
+  box          Box         @relation(fields: [boxId], references: [id])
+  /// Attempt (initial control or correction) in which this cover was accepted.
+  controlAttemptId String         @db.Uuid
+  controlAttempt   ControlAttempt @relation(fields: [controlAttemptId], references: [id])
+  acceptedById String      @db.Uuid
+  acceptedBy   User        @relation(fields: [acceptedById], references: [id])
+  attemptId    String      @unique @db.Uuid
+  attempt      ScanAttempt @relation(fields: [attemptId], references: [id])
+  acceptedAt   DateTime    @default(now()) @db.Timestamptz(3)
+
+  @@index([boxId, acceptedAt])
+  @@index([serial])
+  @@index([boxId, generation, voidedAt])
+}
+
+model ActiveSerialReservation {
+  serial String @id @db.VarChar(30)
+  itemId String @unique @db.Uuid
+  item AcceptedItem @relation(fields: [itemId], references: [id])
+  boxId String @db.Uuid
+  box Box @relation(fields: [boxId], references: [id])
+  generation Int
+  @@index([boxId, generation])
+}
+
+model BrowserPresence {
+  tabId String @id @db.Uuid
+  sessionId String @db.Char(64)
+  workstationId String? @db.Uuid
+  boxId String? @db.Uuid
+  heartbeatAt DateTime @default(now()) @db.Timestamptz(3)
+  activityAt DateTime @default(now()) @db.Timestamptz(3)
+  @@index([sessionId, heartbeatAt])
+  @@index([heartbeatAt])
+}
+
+/// Immutable snapshot of one finalized attempt. A box has one report per finalized attempt.
+model Report {
+  id                  String    @id @default(uuid()) @db.Uuid
+  /// Sequential number; displayed as the report reference (VR-YYYY-NNNNNN).
+  number              Int       @unique @default(autoincrement())
+  boxId               String    @db.Uuid
+  box                 Box       @relation(fields: [boxId], references: [id])
+  attemptId           String         @unique @db.Uuid
+  attempt             ControlAttempt @relation("AttemptReport", fields: [attemptId], references: [id])
+  attemptNumber       Int
+  kind                AttemptKind
+  result              BoxStatus
+  boxSerial           String    @db.VarChar(30)
+  partNumber          String    @db.VarChar(40)
+  galiaPayload        String    @db.VarChar(128)
+  expectedQty         Int
+  acceptedQty         Int
+  difference          Int
+  issues              String[]
+  reason              String?   @db.VarChar(500)
+  finalizedById       String    @db.Uuid
+  finalizedBy         User      @relation(fields: [finalizedById], references: [id])
+  finalizedByUsername String    @db.VarChar(32)
+  finalizedAt         DateTime  @db.Timestamptz(3)
+
+  printJobs         PrintJob[]
+  correctionsFromIt ControlAttempt[] @relation("AttemptPreviousReport")
+
+  @@index([boxId, finalizedAt])
+}
+
+model PrinterProfile {
+  /// Random id kept by the workstation browser; selects this browser's label settings.
+  workstationId     String    @id @db.Uuid
+  name              String    @db.VarChar(64)
+  printerName       String?   @db.VarChar(128)
+  printerUid        String?   @db.VarChar(256)
+  printerConnection String?   @db.VarChar(32)
+  widthMm           Int       @default(100)
+  heightMm          Int       @default(100)
+  /// Legacy device resolution, unused for browser printing (geometry is in mm).
+  dpi               Int?
+  /// Legacy accent preference; browser labels use Unicode SVG text.
+  accentMode        String    @default("UTF8") @db.VarChar(8)
+  confirmedAt       DateTime? @db.Timestamptz(3)
+  confirmedById     String?   @db.Uuid
+  updatedAt         DateTime  @updatedAt @db.Timestamptz(3)
+  updatedById       String?   @db.Uuid
+}
+
+model PrintJob {
+  id                  String         @id @default(uuid()) @db.Uuid
+  idempotencyKey      String         @unique @db.Uuid
+  requestHash         String         @db.Char(64)
+  type                PrintJobType
+  status              PrintJobStatus @default(CREATED)
+  reportId            String?        @db.Uuid
+  report              Report?        @relation(fields: [reportId], references: [id])
+  originalJobId       String?        @db.Uuid
+  requestedById       String         @db.Uuid
+  requestedBy         User           @relation(fields: [requestedById], references: [id])
+  requestedByUsername String         @db.VarChar(32)
+  sessionId           String         @db.Char(64)
+  workstationId       String         @db.Uuid
+  workstationName     String?        @db.VarChar(64)
+  /// PRINT_DIALOG (browser print dialog + Windows driver) or BROWSER_PRINT_ZPL (legacy).
+  method              String         @default("PRINT_DIALOG") @db.VarChar(20)
+  /// Legacy direct-printing fields (null for PRINT_DIALOG jobs: the printer is chosen in the dialog).
+  printerName         String?        @db.VarChar(128)
+  printerUid          String?        @db.VarChar(256)
+  widthMm             Int
+  heightMm            Int
+  dpi                 Int?
+  accentMode          String         @db.VarChar(8)
+  templateVersion     String         @db.VarChar(32)
+  reprintReason       String?        @db.VarChar(200)
+  /// Immutable label snapshot (SVG for PRINT_DIALOG, ZPL for legacy jobs) and its SHA-256.
+  payload             String
+  payloadSha256       String         @db.Char(64)
+  createdAt           DateTime       @default(now()) @db.Timestamptz(3)
+  claimedAt           DateTime?      @db.Timestamptz(3)
+  claimedBySessionId  String?        @db.Char(64)
+  sentAt              DateTime?      @db.Timestamptz(3)
+  finishedAt          DateTime?      @db.Timestamptz(3)
+  errorMessage        String?        @db.VarChar(500)
+
+  @@index([reportId, createdAt])
+  @@index([status, createdAt])
+}
+
+model AuditEvent {
+  id        BigInt   @id @default(autoincrement())
+  type      String   @db.VarChar(40)
+  userId    String?  @db.Uuid
+  username  String?  @db.VarChar(32)
+  sessionId String?  @db.Char(64)
+  boxId     String?  @db.Uuid
+  details   Json?
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([boxId, createdAt])
+  @@index([type, createdAt])
+}
