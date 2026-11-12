@@ -77,6 +77,7 @@ export interface PrinterProfileDto {
   name: string;
   /** Across the printhead. */
   widthMm: number;
+  printableWidthMm: number | null;
   /** Along the feed. */
   heightMm: number;
   orientation: Orientation;
@@ -97,6 +98,7 @@ async function toProfileDto(p: PrinterProfile): Promise<PrinterProfileDto> {
     workstationId: p.workstationId,
     name: p.name,
     widthMm: p.widthMm,
+    printableWidthMm: p.printableWidthMm,
     heightMm: p.heightMm,
     orientation: toOrientation(p.orientation),
     contentPosition: p.contentPosition as ContentPosition,
@@ -116,6 +118,7 @@ export interface ProfileInput {
   workstationId: string;
   name: string;
   widthMm: number;
+  printableWidthMm?: number | null;
   heightMm: number;
   orientation?: Orientation;
   contentPosition?: ContentPosition;
@@ -128,11 +131,13 @@ export async function savePrinterProfile(actor: Actor, input: ProfileInput): Pro
   const orientation = input.orientation ?? toOrientation(before?.orientation);
   const contentPosition = input.contentPosition ?? (before?.contentPosition as ContentPosition | undefined) ?? "CENTER";
   const contentLengthMm = input.contentLengthMm === undefined ? before?.contentLengthMm ?? null : input.contentLengthMm;
-  try { validateConfig({ widthMm: input.widthMm, heightMm: input.heightMm, orientation, contentPosition, contentLengthMm, dpi: LABEL_UNITS_DPI, accentMode: "UTF8" }); } catch (e) { layoutErrorToApp(e); }
-  const changed = !before || before.widthMm !== input.widthMm || before.heightMm !== input.heightMm || toOrientation(before.orientation) !== orientation || before.contentPosition !== contentPosition || before.contentLengthMm !== contentLengthMm;
+  const printableWidthMm = input.printableWidthMm === undefined ? before ? before.printableWidthMm : 104 : input.printableWidthMm;
+  try { validateConfig({ widthMm: input.widthMm, printableWidthMm, heightMm: input.heightMm, orientation, contentPosition, contentLengthMm, dpi: LABEL_UNITS_DPI, accentMode: "UTF8" }); } catch (e) { layoutErrorToApp(e); }
+  const changed = !before || before.widthMm !== input.widthMm || before.printableWidthMm !== printableWidthMm || before.heightMm !== input.heightMm || toOrientation(before.orientation) !== orientation || before.contentPosition !== contentPosition || before.contentLengthMm !== contentLengthMm;
   const data = {
     name: input.name,
     widthMm: input.widthMm,
+    printableWidthMm,
     heightMm: input.heightMm,
     orientation,
     contentPosition,
@@ -149,13 +154,13 @@ export async function savePrinterProfile(actor: Actor, input: ProfileInput): Pro
   await audit(prisma, {
     type: "LABEL_SETTINGS_SAVED",
     actor,
-    details: { workstationId: input.workstationId, name: input.name, widthMm: input.widthMm, heightMm: input.heightMm, orientation, contentPosition, contentLengthMm, confirmationCleared: changed },
+    details: { workstationId: input.workstationId, name: input.name, widthMm: input.widthMm, printableWidthMm, heightMm: input.heightMm, orientation, contentPosition, contentLengthMm, confirmationCleared: changed },
   });
   return toProfileDto(saved);
 }
 
-function labelConfig(p: Pick<PrinterProfile, "widthMm" | "heightMm" | "orientation" | "contentPosition" | "contentLengthMm">): LabelConfig {
-  return { widthMm: p.widthMm, heightMm: p.heightMm, dpi: LABEL_UNITS_DPI, accentMode: "UTF8", orientation: toOrientation(p.orientation), contentPosition: p.contentPosition as ContentPosition, contentLengthMm: p.contentLengthMm };
+function labelConfig(p: Pick<PrinterProfile, "widthMm" | "heightMm" | "orientation" | "contentPosition" | "contentLengthMm" | "printableWidthMm">): LabelConfig {
+  return { widthMm: p.widthMm, printableWidthMm: p.printableWidthMm, heightMm: p.heightMm, dpi: LABEL_UNITS_DPI, accentMode: "UTF8", orientation: toOrientation(p.orientation), contentPosition: p.contentPosition as ContentPosition, contentLengthMm: p.contentLengthMm };
 }
 
 function layoutErrorToApp(e: unknown): never {
@@ -174,7 +179,7 @@ export async function confirmPrinterProfile(actor: Actor, input: { workstationId
     layoutErrorToApp(e);
   }
   const saved = await prisma.printerProfile.update({ where: { workstationId: p.workstationId }, data: { confirmedAt: new Date(), confirmedById: actor.userId } });
-  await audit(prisma, { type: "LABEL_SETTINGS_CONFIRMED", actor, details: { workstationId: p.workstationId, name: p.name, widthMm: p.widthMm, heightMm: p.heightMm, orientation: toOrientation(p.orientation), contentPosition: p.contentPosition, contentLengthMm: p.contentLengthMm, templateVersion: TEMPLATE_VERSION } });
+  await audit(prisma, { type: "LABEL_SETTINGS_CONFIRMED", actor, details: { workstationId: p.workstationId, name: p.name, widthMm: p.widthMm, printableWidthMm: p.printableWidthMm, heightMm: p.heightMm, orientation: toOrientation(p.orientation), contentPosition: p.contentPosition, contentLengthMm: p.contentLengthMm, templateVersion: TEMPLATE_VERSION } });
   return toProfileDto(saved);
 }
 

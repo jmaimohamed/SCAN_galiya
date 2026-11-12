@@ -87,7 +87,7 @@ describe("print jobs for the browser print dialog", () => {
     const { report, raw } = await finalized(op, 2, 2);
     const { job: j } = await job(op, ws, report.id);
     const stored = await prisma.printJob.findUniqueOrThrow({ where: { id: j.id } });
-    expect(stored).toMatchObject({ status: "DIALOG_REQUESTED", method: "PRINT_DIALOG", type: "ORIGINAL", printerName: null, printerUid: null, dpi: null, widthMm: 110, heightMm: 210, orientation: "ROTATE_90", templateVersion: "galia-label-v6-placement" });
+    expect(stored).toMatchObject({ status: "DIALOG_REQUESTED", method: "PRINT_DIALOG", type: "ORIGINAL", printerName: null, printerUid: null, dpi: null, widthMm: 110, heightMm: 210, orientation: "ROTATE_90", templateVersion: "galia-label-v7-width" });
     expect(stored.payloadSha256).toBe(sha256Hex(stored.payload));
     // Plant stock 110 × 210 mm: a roll-size portrait page, with one rotation inside the SVG.
     expect(stored.payload).toMatch(/^<svg[^>]* width="110mm" height="210mm"/);

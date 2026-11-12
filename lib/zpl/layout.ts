@@ -3,7 +3,8 @@
  *
  * Geometry (Zebra ZD421, 203 dpi = 8 dots/mm; 1 layout unit = 1 printer dot)
  *  - `widthMm`  = label / roll width ACROSS the printhead (e.g. 110 mm). The
- *    ZD421 head prints at most 104 mm: anything wider gets extra side margins.
+ *    The default printable band is 104 mm; an explicit custom band/full-width
+ *    calibration can use more of the page without changing printer hardware.
  *  - `heightMm` = label length ALONG the feed (e.g. 210 mm).
  *  - Orientation LANDSCAPE (legacy alternative): the page itself is landscape, heightMm ×
  *    widthMm (e.g. 210 × 110 mm); the Windows driver turns it ONCE onto the
@@ -22,15 +23,15 @@ import { isQrSafePayload, toAsciiVocabulary } from "./encode";
 
 /**
  * Template version recorded on every print job.
- * v5 = roll-size page, larger type and smaller safe margins. Earlier snapshots stay unchanged.
+ * v7 = configurable printable width. Earlier snapshots stay unchanged.
  */
-export const TEMPLATE_VERSION = "galia-label-v6-placement";
+export const TEMPLATE_VERSION = "galia-label-v7-width";
 
 export type Dpi = 203 | 300;
 export const DOTS_PER_MM: Record<Dpi, number> = { 203: 8, 300: 12 };
 
-/** ZD421 thermal-transfer roll ≤ 112 mm; printable band ≤ 104 mm at 203 dpi; length ≤ 991 mm. */
-export const LABEL_LIMITS = { widthMinMm: 50, widthMaxMm: 112, heightMinMm: 50, heightMaxMm: 991 } as const;
+/** Software page bounds, not a promise of support by the selected physical printer. */
+export const LABEL_LIMITS = { widthMinMm: 50, widthMaxMm: 991, heightMinMm: 50, heightMaxMm: 991 } as const;
 /** ZD421 (203 dpi) maximum print width. */
 export const PRINTHEAD_MAX_MM = 104;
 
@@ -45,6 +46,8 @@ export const ORIENTATIONS: readonly Orientation[] = ["LANDSCAPE", "ROTATE_90", "
 
 export interface LabelConfig {
   widthMm: number;
+  /** Omitted = legacy 104 mm band. Null = all measured paper width. */
+  printableWidthMm?: number | null;
   heightMm: number;
   dpi: Dpi;
   accentMode: AccentMode;
@@ -154,7 +157,7 @@ export interface LabelFrame {
   readingHeightMm: number;
   /** Axis of the reading frame that lies across the printhead. */
   acrossAxis: "x" | "y";
-  /** Unprintable band on each side of the roll when it is wider than the head (mm). */
+  /** Unused band on each side when the configured printable width is smaller (mm). */
   acrossOverhangMm: number;
 }
 
@@ -199,6 +202,9 @@ export function validateConfig(config: LabelConfig): void {
   if (!Number.isInteger(heightMm) || heightMm < LABEL_LIMITS.heightMinMm || heightMm > LABEL_LIMITS.heightMaxMm) {
     throw new LabelLayoutError("INVALID_CONFIG", `Longueur (sens d'avance) invalide : ${LABEL_LIMITS.heightMinMm}–${LABEL_LIMITS.heightMaxMm} mm.`);
   }
+  if (config.printableWidthMm != null && (!Number.isInteger(config.printableWidthMm) || config.printableWidthMm < LABEL_LIMITS.widthMinMm || config.printableWidthMm > LABEL_LIMITS.widthMaxMm)) {
+    throw new LabelLayoutError("INVALID_CONFIG", "Largeur imprimable invalide : 50–991 mm, ou toute la largeur du papier.");
+  }
   if (accentMode !== "UTF8" && accentMode !== "ASCII") throw new LabelLayoutError("INVALID_CONFIG", "Mode d'accents invalide.");
   if (config.orientation !== undefined && !ORIENTATIONS.includes(config.orientation)) throw new LabelLayoutError("INVALID_CONFIG", "Orientation invalide.");
   if (config.contentPosition !== undefined && !["TOP", "CENTER", "BOTTOM"].includes(config.contentPosition)) throw new LabelLayoutError("INVALID_CONFIG", "Position invalide.");
@@ -207,9 +213,10 @@ export function validateConfig(config: LabelConfig): void {
   }
 }
 
-export function labelFrame(config: Pick<LabelConfig, "widthMm" | "heightMm" | "orientation">): LabelFrame {
+export function labelFrame(config: Pick<LabelConfig, "widthMm" | "heightMm" | "orientation" | "printableWidthMm">): LabelFrame {
   const orientation = config.orientation ?? "ROTATE_90";
-  const acrossOverhangMm = Math.max(0, (config.widthMm - PRINTHEAD_MAX_MM) / 2);
+  const printableWidth = config.printableWidthMm === null ? config.widthMm : config.printableWidthMm ?? PRINTHEAD_MAX_MM;
+  const acrossOverhangMm = Math.max(0, (config.widthMm - printableWidth) / 2);
   if (orientation === "LANDSCAPE") {
     return { orientation, rotation: 0, pageWidthMm: config.heightMm, pageHeightMm: config.widthMm, readingWidthMm: config.heightMm, readingHeightMm: config.widthMm, acrossAxis: "y", acrossOverhangMm };
   }
@@ -659,7 +666,7 @@ function buildWideResult(c: OkContent | NotOkContent, b: Builder): void {
 }
 
 /** Width of the TEST scale bar (mm) for a reading frame: 50 mm when it fits. */
-export function testRulerMm(config: Pick<LabelConfig, "widthMm" | "heightMm" | "orientation">): number {
+export function testRulerMm(config: Pick<LabelConfig, "widthMm" | "heightMm" | "orientation" | "printableWidthMm">): number {
   const f = labelFrame(config);
   const marginX = (f.acrossAxis === "x" ? f.acrossOverhangMm : 0) + MARGIN_MM + 1.5;
   return Math.min(50, Math.floor((f.readingWidthMm - 2 * marginX) / 10) * 10);
@@ -672,7 +679,7 @@ function buildTest(c: TestContent, b: Builder): void {
   const stockFrame = labelFrame({ ...cfg, heightMm: stockLengthMm });
   const thin = Math.max(3, b.mm(0.3));
   // Edge guide: 1 mm inside the printable band (the roll edge, or the printhead
-  // edge when the roll is wider than 104 mm). Inner guide: the safe content margin.
+  // band edge when it is smaller than the paper). Inner guide: safe content margin.
   // A guide cut off or misplaced shows a wrong size, scale or position.
   const overhang = frame.acrossOverhangMm;
   const ex = b.mm(1 + (frame.acrossAxis === "x" ? overhang : 0));

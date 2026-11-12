@@ -4,6 +4,7 @@ import path from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import { PUT as putProfileRoute } from "@/app/api/printer-profile/route";
 import { POST as createJobRoute } from "@/app/api/print-jobs/route";
+import { PATCH as adminSettingsRoute } from "@/app/api/admin/settings/route";
 import { prisma } from "@/lib/server/db";
 import { scanItem } from "@/lib/server/services/boxes";
 import { confirmPrinterProfile, createPrintJob, getJobLabel, getPrinterProfile, savePrinterProfile } from "@/lib/server/services/printing";
@@ -70,9 +71,51 @@ describe("one server, several operator PCs (browser print dialog)", () => {
     const stored = await prisma.printJob.findUniqueOrThrow({ where: { id: job.id } });
     expect(stored.payload).toMatch(/width="112mm" height="991mm"/);
     expect(stored.payload.match(/rotate\(90\)/g)).toHaveLength(1);
-    for (const dimensions of [{ widthMm: 113, heightMm: 210 }, { widthMm: 110, heightMm: 992 }]) {
+    for (const dimensions of [{ widthMm: 992, heightMm: 210 }, { widthMm: 110, heightMm: 992 }]) {
       expect((await putProfileRoute(request("/api/printer-profile", { method: "PUT", token: op.token, body: { workstationId, name: "INVALIDE", ...dimensions } }), {})).status).toBe(400);
     }
+  });
+
+  it("calibrates widths above 112 mm per workstation, reconfirms changed bands and preserves old snapshots", async () => {
+    const op = await makeActor();
+    const admin = await makeActor("ADMIN");
+    const ws = randomUUID();
+    const other = await setup(op, "AUTRE POSTE");
+    const paper = { workstationId: ws, name: "LARGEUR PERSONNALISÉE", widthMm: 160, heightMm: 400 };
+    expect((await putProfileRoute(request("/api/printer-profile", { method: "PUT", token: op.token, body: paper }), {})).status).toBe(200);
+    expect(await getPrinterProfile(ws)).toMatchObject({ widthMm: 160, printableWidthMm: 104 });
+    await confirmPrinterProfile(op, { workstationId: ws, labelChecked: true });
+    const input = { idempotencyKey: key(), kind: "ORIGINAL" as const, reportId: (await okReport(op)).id, workstationId: ws, reprintReason: null };
+    const first = await createPrintJob(op, input);
+    const old = await prisma.printJob.findUniqueOrThrow({ where: { id: first.job.id } });
+
+    expect((await putProfileRoute(request("/api/printer-profile", { method: "PUT", token: op.token, body: { ...paper, printableWidthMm: null } }), {})).status).toBe(200);
+    expect(await getPrinterProfile(ws)).toMatchObject({ widthMm: 160, printableWidthMm: null, confirmedAt: null });
+    // Omitted optional fields preserve an explicitly selected full-width setting.
+    await savePrinterProfile(op, paper);
+    expect((await getPrinterProfile(ws))?.printableWidthMm).toBeNull();
+    const reprint = { ...input, idempotencyKey: key(), kind: "REPRINT" as const, reprintReason: "Calibrage largeur" };
+    await expect(createPrintJob(op, reprint)).rejects.toMatchObject({ code: "LABEL_NOT_CONFIRMED" });
+    await confirmPrinterProfile(op, { workstationId: ws, labelChecked: true });
+    const fresh = await createPrintJob(op, reprint);
+    const svg = (await getJobLabel(fresh.job.id)).svg!;
+    expect(svg).toContain('width="160mm" height="400mm"');
+    expect(svgQrPath(svg)).not.toBe(svgQrPath(old.payload));
+    expect(await prisma.printJob.findUniqueOrThrow({ where: { id: first.job.id } })).toEqual(old);
+    expect((await createPrintJob(op, input)).job.id).toBe(first.job.id);
+    expect(await getPrinterProfile(other)).toMatchObject({ widthMm: 100, printableWidthMm: 104 });
+
+    const edit = { ...paper, printableWidthMm: 140, reason: "Ajustement de la largeur mesurée" };
+    expect((await adminSettingsRoute(request("/api/admin/settings", { method: "PATCH", token: op.token, body: edit }), {})).status).toBe(403);
+    expect((await adminSettingsRoute(request("/api/admin/settings", { method: "PATCH", token: admin.token, body: edit }), {})).status).toBe(200);
+    expect(await getPrinterProfile(ws)).toMatchObject({ printableWidthMm: 140, confirmedAt: null });
+    const event = await prisma.auditEvent.findFirstOrThrow({ where: { type: "ADMIN_LABEL_SETTINGS", username: admin.username } });
+    expect(event.details).toMatchObject({ before: { printableWidthMm: null }, after: { printableWidthMm: 140 } });
+    for (const printableWidthMm of [0, -1, 992, 110.5]) {
+      expect((await putProfileRoute(request("/api/printer-profile", { method: "PUT", token: op.token, body: { ...paper, printableWidthMm } }), {})).status).toBe(400);
+    }
+    await expect(prisma.printerProfile.update({ where: { workstationId: ws }, data: { widthMm: 992 } })).rejects.toThrow();
+    await expect(prisma.printerProfile.update({ where: { workstationId: ws }, data: { printableWidthMm: 0 } })).rejects.toThrow();
   });
 
   it("each workstation keeps its own label settings; every job records the PC and size it was printed for", async () => {

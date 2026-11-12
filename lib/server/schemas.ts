@@ -70,6 +70,7 @@ export const printerProfileSchema = z.object({
   name: z.string().trim().min(1).max(64),
   /** Actual stock dimensions; the layout separately respects the printhead width. */
   widthMm: z.number().int().min(LABEL_LIMITS.widthMinMm).max(LABEL_LIMITS.widthMaxMm),
+  printableWidthMm: z.number().int().min(LABEL_LIMITS.widthMinMm).max(LABEL_LIMITS.widthMaxMm).nullable().optional(),
   /** Along the feed (label length). */
   heightMm: z.number().int().min(LABEL_LIMITS.heightMinMm).max(LABEL_LIMITS.heightMaxMm),
   orientation: z.enum(["LANDSCAPE", "ROTATE_90", "NONE"]).optional(),

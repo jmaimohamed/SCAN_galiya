@@ -15,10 +15,11 @@ export async function updateAdminLabelSettings(actor: Actor, input: z.infer<type
     const orientation = input.orientation ?? (before.orientation === "NONE" || before.orientation === "ROTATE_90" ? before.orientation : "LANDSCAPE");
     const contentPosition = input.contentPosition ?? before.contentPosition;
     const contentLengthMm = input.contentLengthMm === undefined ? before.contentLengthMm : input.contentLengthMm;
-    if (!printerProfileSchema.safeParse({ ...input, contentPosition, contentLengthMm }).success) throw badRequest("La zone imprimée doit rester dans le papier mesuré.");
-    const changed = before.widthMm !== input.widthMm || before.heightMm !== input.heightMm || before.orientation !== orientation || before.contentPosition !== contentPosition || before.contentLengthMm !== contentLengthMm;
-    const after = await tx.printerProfile.update({ where: { workstationId: before.workstationId }, data: { name: input.name, widthMm: input.widthMm, heightMm: input.heightMm, orientation, contentPosition, contentLengthMm, updatedById: actor.userId, ...(changed ? { confirmedAt: null, confirmedById: null } : {}) } });
-    const values = (p: typeof before) => ({ name: p.name, widthMm: p.widthMm, heightMm: p.heightMm, orientation: p.orientation, contentPosition: p.contentPosition, contentLengthMm: p.contentLengthMm, confirmedAt: p.confirmedAt?.toISOString() ?? null });
+    const printableWidthMm = input.printableWidthMm === undefined ? before.printableWidthMm : input.printableWidthMm;
+    if (!printerProfileSchema.safeParse({ ...input, contentPosition, contentLengthMm, printableWidthMm }).success) throw badRequest("La zone imprimée doit rester dans le papier mesuré.");
+    const changed = before.widthMm !== input.widthMm || before.printableWidthMm !== printableWidthMm || before.heightMm !== input.heightMm || before.orientation !== orientation || before.contentPosition !== contentPosition || before.contentLengthMm !== contentLengthMm;
+    const after = await tx.printerProfile.update({ where: { workstationId: before.workstationId }, data: { name: input.name, widthMm: input.widthMm, printableWidthMm, heightMm: input.heightMm, orientation, contentPosition, contentLengthMm, updatedById: actor.userId, ...(changed ? { confirmedAt: null, confirmedById: null } : {}) } });
+    const values = (p: typeof before) => ({ name: p.name, widthMm: p.widthMm, printableWidthMm: p.printableWidthMm, heightMm: p.heightMm, orientation: p.orientation, contentPosition: p.contentPosition, contentLengthMm: p.contentLengthMm, confirmedAt: p.confirmedAt?.toISOString() ?? null });
     await audit(tx, { type: "ADMIN_LABEL_SETTINGS", actor, details: { target: input.workstationId, reason: input.reason, before: values(before), after: values(after) } });
     return { ok: true };
   }, TX_OPTIONS);

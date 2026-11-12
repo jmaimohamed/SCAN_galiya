@@ -67,7 +67,7 @@ describe("OK label on the plant stock (110 × 210 mm, landscape page turned by t
     expect(svg).toMatch(/^<svg[^>]* viewBox="0 0 1680 880" width="210mm" height="110mm"/);
     expect(svg).not.toContain("rotate(");
     expect(layout.frame).toMatchObject({ orientation: "LANDSCAPE", rotation: 0, pageWidthMm: 210, pageHeightMm: 110, readingWidthMm: 210, readingHeightMm: 110 });
-    expect(TEMPLATE_VERSION).toBe("galia-label-v6-placement");
+    expect(TEMPLATE_VERSION).toBe("galia-label-v7-width");
   });
 
   it("fills the label: content reaches the footer, with large text", () => {
@@ -319,7 +319,35 @@ describe("layout validation for the configured stock", () => {
   });
 
   it("refuses an unsupported size", () => {
-    expect(() => buildLayout(ok, cfg(120, 210))).toThrow(/Largeur/);
+    expect(() => buildLayout(ok, cfg(992, 210))).toThrow(/Largeur/);
     expect(() => buildLayout(ok, cfg(110, 20))).toThrow(/Longueur/);
+  });
+
+  it.each(["NONE", "ROTATE_90", "LANDSCAPE"] as const)("uses a custom width beyond 112 mm without stretching the QR (%s)", (orientation) => {
+    const paper = cfg(160, 400, orientation);
+    const legacy = buildLayout(ok, paper);
+    const expanded = buildLayout(ok, { ...paper, printableWidthMm: null });
+    expect(legacy.frame.acrossOverhangMm).toBe(28);
+    expect(expanded.frame.acrossOverhangMm).toBe(0);
+    expect(expanded.fitScale).toBeGreaterThan(legacy.fitScale);
+    for (const content of [ok, notOk, ...worstCaseContents()]) {
+      const config = { ...paper, printableWidthMm: null };
+      const layout = buildLayout(content, config);
+      for (const el of layout.elements) {
+        const b = bounds(el);
+        expect(b.x).toBeGreaterThanOrEqual(8);
+        expect(b.y).toBeGreaterThanOrEqual(8);
+        expect(b.x + b.w).toBeLessThanOrEqual(layout.widthDots - 8);
+        expect(b.y + b.h).toBeLessThanOrEqual(layout.heightDots - 8);
+      }
+      if (content.template === "OK") {
+        const qr = layout.elements.find((e): e is QrElement => e.type === "qr")!;
+        expect(qr.data).toBe(content.galiaPayload);
+        expect(svgQrPath(renderSvg(layout, { qrMatrix }))).toBe(expectedQrPath(qrMatrix(qr.data), qr.x, qr.y, qr.magnification));
+      } else if (content.template === "NOT_OK") expect(svgQrPath(renderSvg(layout))).toBeNull();
+    }
+    expect(labelFrame({ ...paper, printableWidthMm: 140 }).acrossOverhangMm).toBe(10);
+    expect(labelFrame({ ...paper, printableWidthMm: 200 }).acrossOverhangMm).toBe(0);
+    expect(() => buildLayout(ok, { ...paper, printableWidthMm: 0 })).toThrow(/Largeur imprimable/);
   });
 });

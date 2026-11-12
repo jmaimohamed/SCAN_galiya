@@ -33,7 +33,7 @@ const ORIENTATION_LABELS: Record<Orientation, string> = { LANDSCAPE: "paysage (p
 export function PrinterSettings() {
   const ws = useWorkstationId();
   const [profile, setProfile] = React.useState<PrinterProfileDto | null>(null);
-  const [form, setForm] = React.useState<{ name: string; widthMm: number; heightMm: number; orientation: Orientation; contentPosition: ContentPosition; contentLengthMm: number | null }>({ name: "", widthMm: 110, heightMm: 400, orientation: "ROTATE_90", contentPosition: "CENTER", contentLengthMm: null });
+  const [form, setForm] = React.useState<{ name: string; widthMm: number; printableWidthMm: number | null; heightMm: number; orientation: Orientation; contentPosition: ContentPosition; contentLengthMm: number | null }>({ name: "", widthMm: 110, printableWidthMm: PRINTHEAD_MAX_MM, heightMm: 400, orientation: "ROTATE_90", contentPosition: "CENTER", contentLengthMm: null });
   const [preview, setPreview] = React.useState<{ svg: string; pageSvg: string } | null>(null);
   const [checked, setChecked] = React.useState(false);
   const [testOpened, setTestOpened] = React.useState(false);
@@ -45,7 +45,7 @@ export function PrinterSettings() {
   const applyProfile = React.useCallback((id: string, p: PrinterProfileDto | null) => {
     setProfile(p);
     if (!p) return;
-    setForm({ name: p.name, widthMm: p.widthMm, heightMm: p.heightMm, orientation: p.orientation, contentPosition: p.contentPosition, contentLengthMm: p.contentLengthMm });
+    setForm({ name: p.name, widthMm: p.widthMm, printableWidthMm: p.printableWidthMm, heightMm: p.heightMm, orientation: p.orientation, contentPosition: p.contentPosition, contentLengthMm: p.contentLengthMm });
     apiFetch<{ svg: string; pageSvg: string }>(`/api/printer-profile/test-preview?workstationId=${id}`)
       .then((r) => setPreview({ svg: r.svg, pageSvg: r.pageSvg }))
       .catch(() => setPreview(null));
@@ -64,7 +64,7 @@ export function PrinterSettings() {
     try {
       const r = await apiFetch<{ profile: PrinterProfileDto }>("/api/printer-profile", {
         method: "PUT",
-        body: { workstationId: ws, name: form.name.trim() || "Poste sans nom", widthMm: Number(form.widthMm), heightMm: Number(form.heightMm), orientation: form.orientation, contentPosition: form.contentPosition, contentLengthMm: form.contentLengthMm },
+        body: { workstationId: ws, name: form.name.trim() || "Poste sans nom", widthMm: Number(form.widthMm), printableWidthMm: form.printableWidthMm, heightMm: Number(form.heightMm), orientation: form.orientation, contentPosition: form.contentPosition, contentLengthMm: form.contentLengthMm },
       });
       applyProfile(ws, r.profile);
       setChecked(false);
@@ -114,8 +114,8 @@ export function PrinterSettings() {
   }
 
   const dirty =
-    !!profile && (profile.widthMm !== Number(form.widthMm) || profile.heightMm !== Number(form.heightMm) || profile.name !== form.name || profile.orientation !== form.orientation || profile.contentPosition !== form.contentPosition || profile.contentLengthMm !== form.contentLengthMm);
-  const rulerMm = testRulerMm({ widthMm: Number(form.widthMm), heightMm: form.contentLengthMm ?? Number(form.heightMm), orientation: form.orientation });
+    !!profile && (profile.widthMm !== Number(form.widthMm) || profile.printableWidthMm !== form.printableWidthMm || profile.heightMm !== Number(form.heightMm) || profile.name !== form.name || profile.orientation !== form.orientation || profile.contentPosition !== form.contentPosition || profile.contentLengthMm !== form.contentLengthMm);
+  const rulerMm = testRulerMm({ widthMm: Number(form.widthMm), printableWidthMm: form.printableWidthMm, heightMm: form.contentLengthMm ?? Number(form.heightMm), orientation: form.orientation });
   const landscape = form.orientation === "LANDSCAPE";
 
   return (
@@ -167,6 +167,18 @@ export function PrinterSettings() {
             <fieldset className="flex flex-col gap-2 rounded-md border-2 border-border p-3 sm:col-span-2">
               <legend className="px-1 text-sm font-bold">Occupation et position sur le papier</legend>
               <label className="flex items-start gap-2">
+                <input type="checkbox" className="mt-1 size-5" checked={form.printableWidthMm === null} onChange={(e) => setForm({ ...form, printableWidthMm: e.target.checked ? null : PRINTHEAD_MAX_MM })} />
+                <span><b>Utiliser toute la largeur du papier ({form.widthMm} mm)</b> — agrandir le contenu vers les deux côtés, avec une marge de sécurité de 1,5 mm.</span>
+              </label>
+              {form.printableWidthMm !== null && <div className="flex flex-col gap-1">
+                <Label htmlFor="printable-width">Largeur imprimable maximale (mm)</Label>
+                <Input id="printable-width" type="number" min={LABEL_LIMITS.widthMinMm} max={LABEL_LIMITS.widthMaxMm} value={form.printableWidthMm} onChange={(e) => setForm({ ...form, printableWidthMm: Number(e.target.value) })} />
+                <p className="text-sm text-muted-foreground">La zone est centrée et ne dépasse jamais le papier. Réglage ZD421 203 dpi habituel : {PRINTHEAD_MAX_MM} mm.</p>
+              </div>}
+              {(form.printableWidthMm === null ? form.widthMm : Math.min(form.widthMm, form.printableWidthMm)) > PRINTHEAD_MAX_MM && <p className="rounded-md border-2 border-warn bg-warn-soft p-3 text-sm font-semibold" role="status">
+                Largeur personnalisée : vérifier que l&apos;imprimante et le pilote peuvent l&apos;imprimer. La ZD421 203 dpi imprime au maximum {PRINTHEAD_MAX_MM} mm ; au-delà, les côtés peuvent être coupés. Mesurer le TEST et vérifier les deux cadres avant de confirmer.
+              </p>}
+              <label className="flex items-start gap-2">
                 <input type="checkbox" className="mt-1 size-5" checked={form.contentLengthMm === null} onChange={(e) => setForm({ ...form, contentLengthMm: e.target.checked ? null : Math.min(210, form.heightMm) })} />
                 <span><b>Utiliser toute la longueur du papier ({form.heightMm} mm)</b> — recommandé pour remplir l&apos;étiquette.</span>
               </label>
@@ -182,7 +194,7 @@ export function PrinterSettings() {
             </fieldset>
           </div>
           <p className="text-sm text-muted-foreground">
-            <b>Largeur</b> = largeur du rouleau en travers de la tête (ex. 110 mm ; la ZD421 imprime au plus {PRINTHEAD_MAX_MM} mm, le contenu reste dans cette bande).{" "}
+            <b>Largeur</b> = largeur du papier en travers de la tête. Valeur personnalisée de {LABEL_LIMITS.widthMinMm} à {LABEL_LIMITS.widthMaxMm} mm ; ce plafond logiciel n&apos;est pas une capacité de l&apos;imprimante.{" "}
             <b>Longueur</b> = longueur d&apos;une étiquette dans le sens où elle sort (ex. 210 mm, jusqu&apos;à {LABEL_LIMITS.heightMaxMm} mm).
             Mesurer le papier réel : augmenter ces valeurs sans changer le papier ne corrige pas une réduction à l&apos;impression.
           </p>
@@ -229,7 +241,7 @@ export function PrinterSettings() {
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img alt="Position sur toute la feuille, dans le sens de sortie" className="max-h-96 max-w-full border-2 border-border bg-white" src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(preview.pageSvg)}`} />
             <figcaption className="text-center text-sm">Papier complet enregistré : {profile?.widthMm} × {profile?.heightMm} mm — zone {profile?.contentLengthMm ?? profile?.heightMm} mm,
-              position {profile?.contentPosition === "TOP" ? "en haut" : profile?.contentPosition === "BOTTOM" ? "en bas" : "au centre"}. Le blanc représente le papier laissé libre.</figcaption>
+              position {profile?.contentPosition === "TOP" ? "en haut" : profile?.contentPosition === "BOTTOM" ? "en bas" : "au centre"}, largeur utilisée {profile ? Math.min(profile.widthMm, profile.printableWidthMm ?? profile.widthMm) : "—"} mm. Le blanc représente le papier laissé libre.</figcaption>
           </figure>}
           {profile && !profile.confirmedAt && !dirty && (
             <div className="flex flex-col gap-2 rounded-md border-2 border-border p-3">

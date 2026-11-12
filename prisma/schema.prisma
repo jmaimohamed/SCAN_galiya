@@ -347,8 +347,10 @@ model PrinterProfile {
   printerName       String?   @db.VarChar(128)
   printerUid        String?   @db.VarChar(256)
   printerConnection String?   @db.VarChar(32)
-  /// Label / roll width across the printhead (≤ 112 mm; the 203 dpi head prints 104 mm).
+  /// Custom software page width (≤ 991 mm); physical printer support is separate.
   widthMm           Int       @default(100)
+  /// Maximum usable band across the page; null fills its width. Existing profiles keep 104 mm.
+  printableWidthMm  Int?      @default(104)
   /// Label length along the feed (≤ 991 mm).
   heightMm          Int       @default(100)
   /// LANDSCAPE (landscape page heightMm × widthMm, turned once by the Windows driver),
