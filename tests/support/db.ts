@@ -3,7 +3,7 @@ import { NextRequest } from "next/server";
 import { prisma } from "@/lib/server/db";
 import { sha256Hex } from "@/lib/server/crypto";
 import type { Actor, Role } from "@/lib/server/errors";
-import { openBox } from "@/lib/server/services/boxes";
+import { finalizeBox, getBoxSummary, openBox, type EndTrigger } from "@/lib/server/services/boxes";
 
 /** Empty every table of the TEST database (TRUNCATE does not fire the row guards). */
 export async function resetDb(): Promise<void> {
@@ -38,6 +38,32 @@ export async function openLeased(actor: Actor, raw: string) {
   const r = await openBox(actor, { raw });
   if (r.kind !== "OPENED") throw new Error(`expected OPENED, got ${r.kind}`);
   return { box: r.box, leaseToken: r.leaseToken };
+}
+
+/** Follow the same offer/confirmation contract as the operator UI. */
+export async function restartNok(actor: Actor, input: { raw?: string; boxId?: string; startCorrection?: boolean; removalConfirmed?: boolean }) {
+  const offer = await openBox(actor, input.raw !== undefined ? { raw: input.raw } : { boxId: input.boxId });
+  if (offer.kind !== "CORRECTION_OFFER") return offer;
+  return openBox(actor, { ...input, startCorrection: true, correctionReportId: offer.report.id });
+}
+
+/**
+ * End the open control the way the control page does: with the attempt id and the
+ * counts the operator currently sees (precondition), by GALIA rescan or manually.
+ */
+export async function finishBox(actor: Actor, boxId: string, leaseToken: string, opts: { trigger?: EndTrigger; galiaRaw?: string | null; note?: string | null } = {}) {
+  const s = await getBoxSummary(boxId);
+  if (!s.activeAttempt) throw new Error("no open attempt");
+  const trigger = opts.trigger ?? "MANUAL";
+  return finalizeBox(actor, {
+    boxId,
+    leaseToken,
+    attemptId: s.activeAttempt.id,
+    trigger,
+    galiaRaw: opts.galiaRaw ?? (trigger === "GALIA_RESCAN" ? s.galiaPayload : null),
+    observed: { events: s.counts.events, reserved: s.counts.reserved },
+    note: opts.note ?? null,
+  });
 }
 
 let serialSeq = 70_000_000_000;

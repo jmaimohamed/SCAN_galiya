@@ -6,6 +6,8 @@ import { plantDayStartUtc } from "@/lib/time";
 import { OUTCOME_TITLES } from "@/lib/labels";
 import { toReportSummary, type ReportSummary } from "./boxes";
 import { listReportPrintJobs, type PrintJobDto } from "./printing";
+import { boxRowCounts } from "./dashboard";
+import type { ControlCounts } from "@/lib/counting";
 
 export const HISTORY_PAGE_SIZE = 25;
 
@@ -24,6 +26,9 @@ export interface HistoryRow {
   partNumber: string;
   expectedQty: number;
   acceptedQty: number;
+  /** Open attempt's live counts, or those of the current report. */
+  counts: ControlCounts;
+  lines: string[];
   status: BoxStatus;
   correctionActive: boolean;
   attemptCount: number;
@@ -73,6 +78,7 @@ export async function searchHistory(f: HistoryFilters): Promise<{ rows: HistoryR
       _count: { select: { reservations: true, controlAttempts: true } },
     },
   });
+  const quantities = await boxRowCounts(boxes);
   return {
     total,
     page,
@@ -83,6 +89,8 @@ export async function searchHistory(f: HistoryFilters): Promise<{ rows: HistoryR
       partNumber: b.partNumber,
       expectedQty: b.expectedQty,
       acceptedQty: b._count.reservations,
+      counts: quantities.get(b.id)!.counts,
+      lines: quantities.get(b.id)!.lines,
       status: b.status,
       correctionActive: b.activeAttempt?.kind === "CORRECTION",
       attemptCount: b._count.controlAttempts,
@@ -123,6 +131,8 @@ export interface BoxDetail {
   partNumber: string;
   expectedQty: number;
   acceptedQty: number;
+  counts: ControlCounts;
+  lines: string[];
   status: BoxStatus;
   correctionActive: boolean;
   galiaPayload: string;
@@ -161,13 +171,14 @@ export async function getBoxDetail(boxId: string, pages: { items?: number; attem
   });
   if (!box) throw notFound("Boîte introuvable.");
   const latestId = box.currentReportId;
-  const [events, owner, jobsPerAttempt, rejectionCount, eventCount, voiders] = await Promise.all([
+  const [events, owner, jobsPerAttempt, rejectionCount, eventCount, voiders, quantities] = await Promise.all([
     prisma.auditEvent.findMany({ where: { boxId }, orderBy: { createdAt: "desc" }, take: HISTORY_PAGE_SIZE, skip: skip(pages.events) }),
     box.ownerUserId ? prisma.user.findUnique({ where: { id: box.ownerUserId }, select: { username: true } }) : null,
     Promise.all(box.controlAttempts.map((a) => (a.report ? listReportPrintJobs(a.report.id) : Promise.resolve([])))),
     prisma.scanAttempt.count({ where: { boxId, outcome: { not: "ACCEPTED" } } }),
     prisma.auditEvent.count({ where: { boxId } }),
     prisma.user.findMany({ where: { id: { in: box.generations.flatMap((g) => g.voidedById ? [g.voidedById] : []) } }, select: { id: true, username: true } }),
+    boxRowCounts([box]),
   ]);
   return {
     id: box.id,
@@ -180,6 +191,8 @@ export async function getBoxDetail(boxId: string, pages: { items?: number; attem
     partNumber: box.partNumber,
     expectedQty: box.expectedQty,
     acceptedQty: box._count.reservations,
+    counts: quantities.get(box.id)!.counts,
+    lines: quantities.get(box.id)!.lines,
     status: box.status,
     correctionActive: box.activeAttemptId !== null && box.controlAttempts.some((a) => a.id === box.activeAttemptId && a.kind === "CORRECTION"),
     galiaPayload: box.galiaPayload,

@@ -29,12 +29,16 @@ enum ScanOutcome {
   WRONG_PART_NUMBER
   DUPLICATE_SAME_BOX
   DUPLICATE_OTHER_BOX
+  /// Legacy (rules v1): matching cover refused once the GALIA quantity was reached.
   QUANTITY_REACHED
   BOX_NOT_IN_PROGRESS
   NOT_BOX_OWNER
+  /// Rules v2: distinct matching cover beyond the GALIA quantity. Recorded as an
+  /// observation (counted, makes the control NOT OK) but never reserved.
+  EXCESS
 }
 
-/// INITIAL = first control of a box; CORRECTION = reopening of a NOT OK box to add missing covers.
+/// INITIAL = first control; CORRECTION = complete NOT OK recontrol in a new generation at zero.
 enum AttemptKind {
   INITIAL
   CORRECTION
@@ -178,7 +182,7 @@ model ControlGeneration {
 }
 
 /// One control session of a box: the initial control (#1) or a correction (#2, #3…).
-/// Accepted items stay with the box (cumulative); each finalized attempt has one immutable Report.
+/// Accepted assignments are scoped to a generation; each finalized attempt has one immutable Report.
 model ControlAttempt {
   id               String        @id @default(uuid()) @db.Uuid
   boxId            String        @db.Uuid
@@ -304,6 +308,26 @@ model Report {
   acceptedQty         Int
   difference          Int
   issues              String[]
+  /// 1 = legacy report (only acceptedQty was recorded), 2 = honest counting rules.
+  countingVersion     Int       @default(2) @db.SmallInt
+  /// Distinct cover identities observed in this attempt (conforming + nonconforming).
+  distinctQty         Int       @default(0)
+  /// Right part number and not used elsewhere: reserved (acceptedQty) + excess.
+  conformingQty       Int       @default(0)
+  /// Wrong part number + serial already used in another box.
+  nonconformingQty    Int       @default(0)
+  wrongPartNumberQty  Int       @default(0)
+  otherBoxQty         Int       @default(0)
+  /// Matching covers scanned beyond the GALIA quantity (never reserved).
+  excessQty           Int       @default(0)
+  /// max(0, distinct − expected)
+  extraQty            Int       @default(0)
+  /// max(0, expected − conforming)
+  missingQty          Int       @default(0)
+  duplicateAttempts   Int       @default(0)
+  invalidAttempts     Int       @default(0)
+  /// GALIA_RESCAN (same GALIA rescanned) or MANUAL (« Terminer le contrôle »); null for legacy.
+  endTrigger          String?   @db.VarChar(16)
   reason              String?   @db.VarChar(500)
   finalizedById       String    @db.Uuid
   finalizedBy         User      @relation(fields: [finalizedById], references: [id])
@@ -323,8 +347,16 @@ model PrinterProfile {
   printerName       String?   @db.VarChar(128)
   printerUid        String?   @db.VarChar(256)
   printerConnection String?   @db.VarChar(32)
+  /// Label / roll width across the printhead (≤ 112 mm; the 203 dpi head prints 104 mm).
   widthMm           Int       @default(100)
+  /// Label length along the feed (≤ 991 mm).
   heightMm          Int       @default(100)
+  /// LANDSCAPE (landscape page heightMm × widthMm, turned once by the Windows driver),
+  /// ROTATE_90 (portrait page, content turned 90° in the SVG) or NONE.
+  orientation       String    @default("ROTATE_90") @db.VarChar(12)
+  /// Placement along the physical feed; null length uses the entire measured label.
+  contentPosition   String    @default("CENTER") @db.VarChar(6)
+  contentLengthMm   Int?
   /// Legacy device resolution, unused for browser printing (geometry is in mm).
   dpi               Int?
   /// Legacy accent preference; browser labels use Unicode SVG text.
@@ -357,6 +389,8 @@ model PrintJob {
   printerUid          String?        @db.VarChar(256)
   widthMm             Int
   heightMm            Int
+  /// Orientation of the saved label; widthMm × heightMm above is the printed PAGE size.
+  orientation         String?        @db.VarChar(12)
   dpi                 Int?
   accentMode          String         @db.VarChar(8)
   templateVersion     String         @db.VarChar(32)

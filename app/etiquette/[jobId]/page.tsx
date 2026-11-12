@@ -3,13 +3,16 @@ import { requirePageActor } from "@/lib/server/auth/current";
 import { getJobLabel } from "@/lib/server/services/printing";
 import { PRINT_TYPE_LABELS } from "@/lib/labels";
 import { AppError } from "@/lib/server/errors";
+import { labelPageCss } from "@/lib/label-page";
 
 export const metadata = { title: "Étiquette — GALIA Control" };
 
 /**
  * Label print view: the exact SVG snapshot stored with the print job, at its
  * physical size. `@page` sets the paper to the label size with no margin; when
- * printing, only the label is visible. The application loads this page in a frame
+ * printing, only the label is visible (CSS in lib/label-page.ts). The saved SVG
+ * already holds the 90° rotation of a landscape label: nothing is rotated here.
+ * The application loads this page in a frame
  * and calls window.print() on it; the operator picks the printer in the dialog.
  * There is deliberately no print button here (prints go through the tracked
  * « Imprimer l'étiquette » / « Réimprimer… » actions).
@@ -27,15 +30,7 @@ export default async function LabelPrintView({ params }: { params: Promise<{ job
   const { job, svg } = data;
   const w = job.widthMm;
   const h = job.heightMm;
-  const css = `
-@page { size: ${w}mm ${h}mm; margin: 0; }
-.label-sheet { width: ${w}mm; height: ${h}mm; overflow: hidden; background: #fff; }
-.label-sheet img { display: block; width: ${w}mm; height: ${h}mm; }
-@media print {
-  html, body { margin: 0 !important; padding: 0 !important; width: ${w}mm; height: ${h}mm; min-height: 0 !important; overflow: hidden; background: #fff !important; }
-  .label-screen-only { display: none !important; }
-  .label-sheet { margin: 0 !important; box-shadow: none !important; border: 0 !important; }
-}`;
+  const css = labelPageCss(w, h);
 
   return (
     <>
@@ -47,7 +42,8 @@ export default async function LabelPrintView({ params }: { params: Promise<{ job
         </p>
         <p className="text-muted-foreground">
           Pour imprimer, utiliser « Imprimer l&apos;étiquette » ou « Réimprimer… » dans l&apos;application. Dans la fenêtre d&apos;impression : imprimante ZD421 de ce
-          poste, papier {w} × {h} mm, échelle 100 % (taille réelle), marges aucune, en-têtes et pieds de page désactivés.
+          poste, papier {job.orientation === "LANDSCAPE" ? h : w} × {job.orientation === "LANDSCAPE" ? w : h} mm,
+          orientation {job.orientation === "LANDSCAPE" ? "Paysage" : "Portrait"}, échelle 100 % (taille réelle), marges aucune, en-têtes et pieds de page désactivés.
         </p>
       </div>
       {svg ? (

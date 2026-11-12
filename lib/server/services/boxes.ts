@@ -7,6 +7,7 @@ import { randomToken, safeEqualHex, sha256Hex } from "../crypto";
 import { AppError, conflict, notFound, type Actor } from "../errors";
 import { boundRaw, parseBoxLabel, parseItemLabel, type ParseError } from "@/lib/barcode";
 import { OUTCOME_TITLES, reportReference } from "@/lib/labels";
+import { computeCounts, countsFromReport, issueCodes, issueLines, isStrictOk, piecesToRemove, type ControlCounts } from "@/lib/counting";
 import { assertBoxAccess } from "../permissions";
 
 type Tx = Prisma.TransactionClient;
@@ -18,11 +19,23 @@ type Tx = Prisma.TransactionClient;
  *  - Box.activeAttemptId is the open attempt (null = closed).
  *  - Box.status is IN_PROGRESS until the first finalization, then the LATEST
  *    finalized result. A NOT OK box under correction stays NOK + open attempt.
- *  - Accepted items belong to the box (cumulative across attempts) and record
- *    the attempt that accepted them. Every finalized attempt has its own
+ *  - Confirmed NOT OK recontrols start a new generation at ZERO. The previous
+ *    accepted assignments are voided and released, while their records remain.
+ *    Every finalized attempt has its own
  *    immutable Report; older reports are never modified.
  *  - A closed OK box is read-only. A closed NOT OK box is reopened only after
- *    the operator explicitly confirms ("OUI — Corriger").
+ *    the operator explicitly confirms ("OUI — Recommencer à zéro").
+ *
+ * Start / end (counting rules v2, see lib/counting.ts)
+ *  - Scanning the GALIA opens the control. Covers are collected until the
+ *    operator ENDS the control: reaching the GALIA quantity never finalizes,
+ *    locks or prints anything.
+ *  - Ending = rescanning the exact same GALIA payload (or « Terminer le
+ *    contrôle »): one server path, finalizeBox(), that recomputes every count
+ *    under the box lock and decides OK / NOT OK.
+ *  - Every distinct cover is recorded: conforming covers within the quantity
+ *    are reserved; excess, wrong-PN and other-box covers are observations that
+ *    reserve nothing. Duplicate and invalid scans are recorded mistakes.
  */
 
 /* ------------------------------------------------------------------ DTOs */
@@ -48,9 +61,22 @@ export interface ReportSummary {
   acceptedQty: number;
   difference: number;
   issues: string[];
+  /** 1 = legacy report (accepted quantity only), 2 = honest counting rules. */
+  countingVersion: number;
+  counts: ControlCounts;
+  /** Concise French explanation (same lines as the label). */
+  lines: string[];
+  endTrigger: "GALIA_RESCAN" | "MANUAL" | null;
   reason: string | null;
   finalizedAt: string;
   finalizedBy: string;
+}
+
+/** A piece seen in a NOT OK control that must be taken out of the box. Screens only, never on the label. */
+export interface PieceToRemove {
+  serial: string;
+  partNumber: string | null;
+  reason: "EXCESS" | "WRONG_PART_NUMBER" | "OTHER_BOX_SERIAL";
 }
 
 export interface BoxSummary {
@@ -60,8 +86,11 @@ export interface BoxSummary {
   boxSerial: string;
   partNumber: string;
   expectedQty: number;
+  /** Conforming covers reserved by this box's current generation. */
   acceptedCount: number;
   remaining: number;
+  /** Counts of the open attempt; when closed, those of the latest report. */
+  counts: ControlCounts;
   /** IN_PROGRESS before the first finalization, otherwise the latest finalized result. */
   status: Box["status"];
   galiaPayload: string;
@@ -91,7 +120,7 @@ export interface ScanResult {
   errorCode: string | null;
   duplicate: { boxId: string; boxSerial: string; acceptedAt: string; acceptedBy: string } | null;
   item: { id: string; serial: string; partNumber: string; acceptedAt: string; acceptedBy: string; attemptNumber: number } | null;
-  box: { id: string; acceptedCount: number; expectedQty: number; remaining: number; status: Box["status"]; open: boolean };
+  box: { id: string; acceptedCount: number; expectedQty: number; remaining: number; status: Box["status"]; open: boolean; counts: ControlCounts };
   createdAt: string;
   replayed: boolean;
 }
@@ -99,16 +128,21 @@ export interface ScanResult {
 export type OpenBoxResult =
   | { kind: "OPENED"; box: BoxSummary; leaseToken: string; created: boolean; tookOverFrom: string | null; correctionStarted: boolean }
   | { kind: "FINALIZED"; box: BoxSummary }
-  | { kind: "CORRECTION_OFFER"; box: BoxSummary; report: ReportSummary }
+  | { kind: "CORRECTION_OFFER"; box: BoxSummary; report: ReportSummary; toRemove: PieceToRemove[] }
   | { kind: "OWNED"; box: BoxSummary; owner: { username: string; since: string | null; sameUser: boolean; sameSession: boolean } }
   | { kind: "CONFLICT"; existing: { boxSerial: string; partNumber: string; expectedQty: number }; scanned: { partNumber: string; quantity: number } }
   | { kind: "INVALID"; error: ParseError };
 
+export type EndTrigger = "GALIA_RESCAN" | "MANUAL";
+
 export type FinalizeResult =
   | { kind: "FINALIZED"; report: ReportSummary }
-  | { kind: "ALREADY_FINALIZED"; report: ReportSummary | null }
-  | { kind: "STATE_CHANGED"; acceptedCount: number }
-  | { kind: "REASON_REQUIRED"; acceptedCount: number; expectedQty: number };
+  /** Idempotent retry: this attempt was already finalized; same report. */
+  | { kind: "ALREADY_FINALIZED"; report: ReportSummary }
+  /** The client's view is stale (a scan it has not seen): nothing was finalized. */
+  | { kind: "STATE_CHANGED"; counts: ControlCounts }
+  /** The scanned GALIA is not this box's exact payload: nothing was finalized. */
+  | { kind: "GALIA_MISMATCH"; scanned: { boxSerial: string; partNumber: string; quantity: number } | null };
 
 /* -------------------------------------------------------------- helpers */
 
@@ -127,6 +161,7 @@ export function isLeaseHolder(box: Pick<Box, "ownerSessionId" | "leaseTokenHash"
 }
 
 export function toReportSummary(r: Report): ReportSummary {
+  const counts = countsFromReport(r);
   return {
     id: r.id,
     boxId: r.boxId,
@@ -140,6 +175,10 @@ export function toReportSummary(r: Report): ReportSummary {
     acceptedQty: r.acceptedQty,
     difference: r.difference,
     issues: r.issues,
+    countingVersion: r.countingVersion,
+    counts,
+    lines: issueLines(counts),
+    endTrigger: r.endTrigger === "GALIA_RESCAN" || r.endTrigger === "MANUAL" ? r.endTrigger : null,
     reason: r.reason,
     finalizedAt: r.finalizedAt.toISOString(),
     finalizedBy: r.finalizedByUsername,
@@ -147,6 +186,39 @@ export function toReportSummary(r: Report): ReportSummary {
 }
 
 type Db = Tx | typeof prisma;
+
+const OBSERVATION_OUTCOMES = ["EXCESS", "QUANTITY_REACHED", "WRONG_PART_NUMBER", "DUPLICATE_OTHER_BOX"] as const satisfies readonly ScanOutcome[];
+
+/** Counts of one attempt: reservations of the box + the attempt's recorded scans. */
+async function attemptCounts(db: Db, box: { id: string; expectedQty: number }, attemptId: string | null): Promise<ControlCounts> {
+  const [reserved, observations] = await Promise.all([
+    db.activeSerialReservation.count({ where: { boxId: box.id } }),
+    attemptId ? db.scanAttempt.findMany({ where: { controlAttemptId: attemptId }, select: { outcome: true, serial: true } }) : Promise.resolve([]),
+  ]);
+  return computeCounts(box.expectedQty, reserved, observations);
+}
+
+/** Distinct pieces recorded as excess / wrong PN / other box in a finalized attempt. */
+async function piecesToRemoveOf(db: Db, report: Report): Promise<PieceToRemove[]> {
+  if (report.countingVersion < 2 || piecesToRemove(countsFromReport(report)) === 0) return [];
+  const rows = await db.scanAttempt.findMany({
+    where: { controlAttemptId: report.attemptId, outcome: { in: [...OBSERVATION_OUTCOMES] } },
+    orderBy: { createdAt: "asc" },
+    select: { outcome: true, serial: true, partNumber: true },
+  });
+  const seen = new Set<string>();
+  const out: PieceToRemove[] = [];
+  for (const r of rows) {
+    if (!r.serial || seen.has(r.serial)) continue;
+    seen.add(r.serial);
+    out.push({
+      serial: r.serial,
+      partNumber: r.partNumber,
+      reason: r.outcome === "WRONG_PART_NUMBER" ? "WRONG_PART_NUMBER" : r.outcome === "DUPLICATE_OTHER_BOX" ? "OTHER_BOX_SERIAL" : "EXCESS",
+    });
+  }
+  return out;
+}
 
 async function latestReport(db: Db, boxId: string): Promise<Report | null> {
   const box = await db.box.findUnique({ where: { id: boxId }, select: { currentReportId: true } });
@@ -168,6 +240,7 @@ async function loadSummary(db: Db, boxId: string): Promise<BoxSummary> {
   ]);
   const acceptedCount = box._count.reservations;
   const a = box.activeAttempt;
+  const counts = a || !latest ? await attemptCounts(db, box, a?.id ?? null) : countsFromReport(latest);
   return {
     id: box.id,
     generation: box.generation,
@@ -177,6 +250,7 @@ async function loadSummary(db: Db, boxId: string): Promise<BoxSummary> {
     expectedQty: box.expectedQty,
     acceptedCount,
     remaining: Math.max(0, box.expectedQty - acceptedCount),
+    counts,
     status: box.status,
     galiaPayload: box.galiaPayload,
     createdAt: box.createdAt.toISOString(),
@@ -204,14 +278,48 @@ async function grantLease(tx: Tx, box: Box, actor: Actor): Promise<string> {
   return leaseToken;
 }
 
-/** Open a correction attempt on a closed NOT OK box (caller holds the box lock). */
-async function openCorrection(tx: Tx, box: Box, actor: Actor): Promise<OpenBoxResult> {
+/**
+ * Open a complete recontrol at ZERO (caller holds the box lock). The confirmation
+ * names the exact NOT OK report so an old request cannot reset a later result.
+ * Pieces that were recorded as excess,
+ * wrong PN or already used elsewhere are physically in the box: the operator must
+ * confirm they were removed (audited) before the correction can start.
+ */
+async function openCorrection(tx: Tx, box: Box, actor: Actor, removalConfirmed: boolean, expectedReportId?: string): Promise<OpenBoxResult> {
   const previous = await latestReport(tx, box.id);
   if (!previous || previous.result !== "NOK") {
     throw conflict("NOT_CORRECTABLE", "Seule une boîte contrôlée NOT OK peut être corrigée.");
   }
+  if (expectedReportId !== previous.id) {
+    throw conflict("CORRECTION_CHANGED", "Le résultat NOT OK a changé. Rescanner la GALIA et confirmer le nouveau contrôle depuis zéro.");
+  }
+  const toRemove = await piecesToRemoveOf(tx, previous);
+  if (toRemove.length > 0 && !removalConfirmed) {
+    const n = toRemove.length;
+    throw conflict(
+      "REMOVAL_CONFIRMATION_REQUIRED",
+      `Retirer d'abord de la boîte ${n} pièce${n > 1 ? "s" : ""} non conforme${n > 1 ? "s" : ""} ou en excédent, puis confirmer.`,
+      { toRemove },
+    );
+  }
   const max = await tx.controlAttempt.aggregate({ where: { boxId: box.id }, _max: { number: true } });
   const number = (max._max.number ?? 0) + 1;
+  const reason = "Recontrôle complet NOT OK confirmé : reprise à zéro.";
+  await tx.$queryRaw`SELECT set_config('galia.nok_restart_session', ${actor.sessionId}, true),
+    set_config('galia.nok_restart_box', ${box.id}, true), set_config('galia.nok_restart_report', ${previous.id}, true),
+    set_config('galia.nok_restart_reason', ${reason}, true)`;
+  const now = new Date();
+  const released = await tx.acceptedItem.updateMany({
+    where: { boxId: box.id, generation: box.generation, voidedAt: null },
+    data: { voidedAt: now, voidedById: actor.userId, voidReason: reason },
+  });
+  await tx.controlAttempt.updateMany({ where: { boxId: box.id, generation: box.generation, voidedAt: null }, data: { voidedAt: now } });
+  await tx.controlGeneration.update({ where: { boxId_number: { boxId: box.id, number: box.generation } }, data: { voidedAt: now, voidedById: actor.userId, voidReason: reason } });
+  const generation = box.generation + 1;
+  await tx.controlGeneration.create({ data: { boxId: box.id, number: generation, partNumber: box.partNumber, boxSerial: box.boxSerial, expectedQty: box.expectedQty, galiaPayload: box.galiaPayload, startedAt: now } });
+  box = await tx.box.update({ where: { id: box.id }, data: { generation, generationStartedAt: now, status: "IN_PROGRESS", needsRecontrol: true,
+    currentReportId: null, activeAttemptId: null, finalizedAt: null, finalizedById: null,
+    ownerUserId: null, ownerSessionId: null, leaseTokenHash: null, ownerSince: null } });
   const attempt = await tx.controlAttempt.create({
     data: { boxId: box.id, generation: box.generation, number, kind: "CORRECTION", startedById: actor.userId, previousReportId: previous.id },
   });
@@ -228,6 +336,15 @@ async function openCorrection(tx: Tx, box: Box, actor: Actor): Promise<OpenBoxRe
       previousReportId: previous.id,
       previousReference: reportReference(previous.number, previous.finalizedAt),
       previousAcceptedQty: previous.acceptedQty,
+      reason,
+      mode: "FROM_ZERO",
+      releasedSerials: released.count,
+      before: { generation: generation - 1, acceptedQty: previous.acceptedQty, reportId: previous.id },
+      after: { generation, acceptedQty: 0, reportId: null },
+      instruction: "Retirer les anciennes étiquettes. Rescanner chaque coiffe ; les anciennes séries sont libérées et peuvent être utilisées dans une autre boîte.",
+      previousIssues: previous.issues,
+      removalConfirmed: toRemove.length > 0 ? true : null,
+      removedPieces: toRemove.map((p) => ({ ...p })),
     },
   });
   return { kind: "OPENED", box: await loadSummary(tx, box.id), leaseToken, created: false, tookOverFrom: null, correctionStarted: true };
@@ -237,7 +354,7 @@ async function acquire(
   tx: Tx,
   box: Box,
   actor: Actor,
-  opts: { takeover: boolean; created: boolean; startCorrection: boolean },
+  opts: { takeover: boolean; created: boolean; startCorrection: boolean; removalConfirmed: boolean; correctionReportId?: string },
 ): Promise<OpenBoxResult> {
   if (box.activeAttemptId === null && box.status === "IN_PROGRESS" && !box.currentReportId) {
     const max = await tx.controlAttempt.aggregate({ where: { boxId: box.id }, _max: { number: true } });
@@ -247,10 +364,10 @@ async function acquire(
   }
   if (box.activeAttemptId === null) {
     if (box.status === "NOK") {
-      if (opts.startCorrection) return openCorrection(tx, box, actor);
-      const previous = await latestReport(tx, box.id);
-      await audit(tx, { type: "BOX_CORRECTION_OFFERED", actor, boxId: box.id, details: { reportId: previous?.id ?? null } });
-      return { kind: "CORRECTION_OFFER", box: await loadSummary(tx, box.id), report: toReportSummary(previous!) };
+      if (opts.startCorrection) return openCorrection(tx, box, actor, opts.removalConfirmed, opts.correctionReportId);
+      const previous = (await latestReport(tx, box.id))!;
+      await audit(tx, { type: "BOX_CORRECTION_OFFERED", actor, boxId: box.id, details: { reportId: previous.id } });
+      return { kind: "CORRECTION_OFFER", box: await loadSummary(tx, box.id), report: toReportSummary(previous), toRemove: await piecesToRemoveOf(tx, previous) };
     }
     await audit(tx, { type: "BOX_VIEWED_FINALIZED", actor, boxId: box.id });
     return { kind: "FINALIZED", box: await loadSummary(tx, box.id) };
@@ -294,14 +411,14 @@ async function acquire(
  * - Never creates a second record for the same box serial; a serial already known
  *   with another PN or quantity is a CONFLICT and nothing is changed.
  * - A closed NOT OK box returns CORRECTION_OFFER unless `startCorrection` is true
- *   (the operator pressed "OUI — Corriger"); nothing changes before that.
+ *   (the operator confirmed the exact offered report); nothing changes before that.
  * - A closed OK box opens read-only (FINALIZED).
  */
 export async function openBox(
   actor: Actor,
-  input: { raw?: string; boxId?: string; takeover?: boolean; startCorrection?: boolean },
+  input: { raw?: string; boxId?: string; takeover?: boolean; startCorrection?: boolean; removalConfirmed?: boolean; correctionReportId?: string },
 ): Promise<OpenBoxResult> {
-  const opts = { takeover: input.takeover === true, startCorrection: input.startCorrection === true };
+  const opts = { takeover: input.takeover === true, startCorrection: input.startCorrection === true, removalConfirmed: input.removalConfirmed === true, correctionReportId: input.correctionReportId };
   if (input.boxId) {
     const boxId = input.boxId;
     await assertBoxAccess(actor, boxId);
@@ -387,13 +504,13 @@ type AttemptWithItem = ScanAttempt & {
 function attemptToResult(
   attempt: AttemptWithItem,
   box: { id: string; partNumber: string; expectedQty: number; status: Box["status"]; activeAttemptId: string | null },
-  acceptedCount: number,
+  counts: ControlCounts,
   actorUsername: string,
   replayed: boolean,
 ): ScanResult {
   const detail = (attempt.detail ?? {}) as Record<string, unknown>;
   const duplicate =
-    attempt.outcome === "DUPLICATE_OTHER_BOX" || attempt.outcome === "DUPLICATE_SAME_BOX"
+    (attempt.outcome === "DUPLICATE_OTHER_BOX" || attempt.outcome === "DUPLICATE_SAME_BOX") && typeof detail.boxSerial === "string"
       ? {
           boxId: String(detail.boxId ?? ""),
           boxSerial: String(detail.boxSerial ?? ""),
@@ -426,11 +543,12 @@ function attemptToResult(
       : null,
     box: {
       id: box.id,
-      acceptedCount,
+      acceptedCount: counts.reserved,
       expectedQty: box.expectedQty,
-      remaining: Math.max(0, box.expectedQty - acceptedCount),
+      remaining: Math.max(0, box.expectedQty - counts.reserved),
       status: box.status,
       open: box.activeAttemptId !== null,
+      counts,
     },
     createdAt: attempt.createdAt.toISOString(),
     replayed,
@@ -455,15 +573,17 @@ async function replayIfKnown(db: Db, actor: Actor, idempotencyKey: string, reque
   if (attempt.generation !== attempt.box.generation || attempt.acceptedItem?.voidedAt || (attempt.box.needsRecontrol && !attempt.box.activeAttemptId)) {
     throw conflict("CONTROL_INVALIDATED", "Ce scan appartient à un contrôle annulé. Rescanner la GALIA pour recontrôler.");
   }
-  const count = await db.activeSerialReservation.count({ where: { boxId: attempt.boxId } });
-  return attemptToResult(attempt, attempt.box, count, attempt.user.username, true);
+  // A retried request is never a second scan: same row, same answer, counts unchanged.
+  const counts = await attemptCounts(db, attempt.box, attempt.controlAttemptId);
+  return attemptToResult(attempt, attempt.box, counts, attempt.user.username, true);
 }
 
 /**
- * Validate and (if every rule passes) accept one seat-cover scan, atomically.
- * Order of checks under the box row lock: box open, lease ownership, format,
- * exact PN equality, global serial uniqueness, remaining (cumulative) quantity.
- * Only ACCEPTED scans create an AcceptedItem (and so reserve the serial).
+ * Record one seat-cover scan, atomically, under the box row lock.
+ * Order of checks: box open, lease ownership, format, already seen in this box,
+ * exact PN, serial reserved by another box, GALIA quantity reached (excess).
+ * Only ACCEPTED scans create an AcceptedItem (and so reserve the serial); every
+ * other answer is a recorded observation or mistake that counts in the result.
  */
 export async function scanItem(
   actor: Actor,
@@ -497,7 +617,7 @@ async function scanInTransaction(
     return replay;
   }
 
-  const box = await tx.box.findUniqueOrThrow({ where: { id: input.boxId } });
+  const box = leaseBox;
   const count = await tx.activeSerialReservation.count({ where: { boxId: box.id } });
   const parsed = parseItemLabel(input.raw);
 
@@ -507,6 +627,7 @@ async function scanInTransaction(
 
   if (box.activeAttemptId === null) {
     outcome = "BOX_NOT_IN_PROGRESS";
+    detail = { message: "Contrôle déjà terminé : ce scan n'est pas compté. Si une pièce a été ajoutée, rescanner la GALIA pour corriger." };
   } else if (!isLeaseHolder(box, actor, input.leaseToken)) {
     outcome = "NOT_BOX_OWNER";
     const owner = box.ownerUserId ? await tx.user.findUnique({ where: { id: box.ownerUserId }, select: { username: true } }) : null;
@@ -515,24 +636,53 @@ async function scanInTransaction(
     outcome = "INVALID_FORMAT";
     errorCode = parsed.code;
     detail = { message: parsed.message };
-  } else if (parsed.partNumber !== box.partNumber) {
-    outcome = "WRONG_PART_NUMBER";
-    detail = { message: `Attendu ${box.partNumber}, reçu ${parsed.partNumber}.` };
   } else {
-    const existing = await tx.acceptedItem.findFirst({
-      where: { serial: parsed.serial, voidedAt: null, reservation: { isNot: null } },
-      include: { box: { select: { id: true, boxSerial: true } }, acceptedBy: { select: { username: true } } },
+    const reservation = await tx.activeSerialReservation.findUnique({
+      where: { serial: parsed.serial },
+      include: { item: { include: { box: { select: { id: true, boxSerial: true } }, acceptedBy: { select: { username: true } } } } },
     });
-    if (existing) {
-      outcome = existing.boxId === box.id ? "DUPLICATE_SAME_BOX" : "DUPLICATE_OTHER_BOX";
+    const observed =
+      reservation?.boxId === box.id
+        ? null
+        : await tx.scanAttempt.findFirst({
+            where: { controlAttemptId: box.activeAttemptId, serial: parsed.serial, outcome: { in: [...OBSERVATION_OUTCOMES] } },
+            orderBy: { createdAt: "asc" },
+            select: { outcome: true, createdAt: true },
+          });
+    if (reservation?.boxId === box.id) {
+      outcome = "DUPLICATE_SAME_BOX";
       detail = {
-        boxId: existing.box.id,
-        boxSerial: existing.box.boxSerial,
-        acceptedAt: existing.acceptedAt.toISOString(),
-        acceptedBy: existing.acceptedBy.username,
+        message: "Cette coiffe est déjà comptée dans cette boîte : la quantité ne change pas.",
+        boxId: box.id,
+        boxSerial: box.boxSerial,
+        acceptedAt: reservation.item.acceptedAt.toISOString(),
+        acceptedBy: reservation.item.acceptedBy.username,
+        firstOutcome: "ACCEPTED",
+      };
+    } else if (observed) {
+      outcome = "DUPLICATE_SAME_BOX";
+      detail = {
+        message: `Cette pièce a déjà été scannée dans ce contrôle (${OUTCOME_TITLES[observed.outcome]}) : la quantité ne change pas.`,
+        firstOutcome: observed.outcome,
+        firstAt: observed.createdAt.toISOString(),
+      };
+    } else if (parsed.partNumber !== box.partNumber) {
+      outcome = "WRONG_PART_NUMBER";
+      detail = { message: `Attendu ${box.partNumber}, reçu ${parsed.partNumber}. Pièce non conforme : la retirer de la boîte.` };
+    } else if (reservation) {
+      // The other box keeps its reservation: nothing is transferred.
+      outcome = "DUPLICATE_OTHER_BOX";
+      detail = {
+        message: "Série déjà utilisée dans une autre boîte : pièce non conforme pour celle-ci.",
+        boxId: reservation.item.box.id,
+        boxSerial: reservation.item.box.boxSerial,
+        acceptedAt: reservation.item.acceptedAt.toISOString(),
+        acceptedBy: reservation.item.acceptedBy.username,
       };
     } else if (count >= box.expectedQty) {
-      outcome = "QUANTITY_REACHED";
+      // Recorded excess; the serial is NOT reserved (it stays free for its real box).
+      outcome = "EXCESS";
+      detail = { message: `Quantité GALIA déjà atteinte (${box.expectedQty}) : pièce en excédent, à retirer de la boîte.` };
     } else {
       outcome = "ACCEPTED";
     }
@@ -574,52 +724,72 @@ async function scanInTransaction(
       select: ITEM_SELECT,
     });
   }
-  const acceptedCount = count + (acceptedItem ? 1 : 0);
-  return attemptToResult({ ...attempt, acceptedItem }, box, acceptedCount, actor.username, false);
+  const counts = await attemptCounts(tx, box, box.activeAttemptId);
+  return attemptToResult({ ...attempt, acceptedItem }, box, counts, actor.username, false);
 }
 
 /* -------------------------------------------------------------- finalize */
 
-export const FINALIZE_REASON_MIN = 3;
+export interface FinalizeInput {
+  boxId: string;
+  leaseToken: string;
+  /** The attempt the client is ending: a retry after success returns the same report. */
+  attemptId: string;
+  trigger: EndTrigger;
+  /** For GALIA_RESCAN: the raw GALIA scan, which must be this box's exact payload. */
+  galiaRaw?: string | null;
+  /** What the operator saw (precondition only — the server recomputes everything). */
+  observed: { events: number; reserved: number };
+  /** Optional operator note saved on a NOT OK report. */
+  note?: string | null;
+}
 
 /**
- * Finalize the open attempt. The result is recomputed from ALL committed items
- * of the box (cumulative across attempts) under the box lock — never taken from
- * the client. `observedAcceptedCount` is only a precondition. A new immutable
- * report is created for this attempt; earlier reports are left untouched.
+ * End the open attempt (GALIA rescan or « Terminer le contrôle » — same path).
+ * Under the box lock: recomputes the counts from the committed reservations and
+ * this attempt's recorded scans, decides OK / NOT OK (strict), saves one
+ * immutable report and closes the attempt. A scan racing this transaction is
+ * serialized by the same lock: either it is counted (and the client's stale
+ * `observed` makes this call return STATE_CHANGED) or it arrives after the
+ * attempt closed and is recorded as BOX_NOT_IN_PROGRESS (never silently lost).
  */
-export async function finalizeBox(
-  actor: Actor,
-  input: { boxId: string; leaseToken: string; observedAcceptedCount: number; incompleteReason?: string | null },
-): Promise<FinalizeResult> {
+export async function finalizeBox(actor: Actor, input: FinalizeInput): Promise<FinalizeResult> {
   return prisma.$transaction(async (tx) => {
     if (!(await lockBoxById(tx, input.boxId))) throw notFound("Boîte introuvable.");
     const box = await tx.box.findUniqueOrThrow({ where: { id: input.boxId }, include: { activeAttempt: true } });
-    if (!box.activeAttempt) {
-      if (box.needsRecontrol || !box.currentReportId) throw conflict("CONTROL_INVALIDATED", "Contrôle invalidé : rescanner la GALIA pour recontrôler.");
-      const latest = await latestReport(tx, box.id);
-      return { kind: "ALREADY_FINALIZED", report: latest ? toReportSummary(latest) : null };
+
+    // Idempotent retry of an end request that already succeeded.
+    if (box.activeAttemptId !== input.attemptId) {
+      const done = await tx.report.findUnique({ where: { attemptId: input.attemptId } });
+      if (done && done.boxId === box.id) {
+        if (actor.role !== "ADMIN" && done.finalizedById !== actor.userId) throw conflict("NOT_BOX_OWNER", "Contrôle terminé par une autre session.");
+        if (box.needsRecontrol || box.currentReportId !== done.id) throw conflict("CONTROL_INVALIDATED", "Ce contrôle a été remplacé ou invalidé : rescanner la GALIA.");
+        return { kind: "ALREADY_FINALIZED", report: toReportSummary(done) };
+      }
+      if (!box.activeAttempt) {
+        if (box.needsRecontrol || !box.currentReportId) throw conflict("CONTROL_INVALIDATED", "Contrôle invalidé : rescanner la GALIA pour recontrôler.");
+        throw conflict("ATTEMPT_CHANGED", "Ce contrôle n'est plus ouvert : rescanner la GALIA.");
+      }
+      throw conflict("ATTEMPT_CHANGED", "Un autre contrôle de cette boîte est ouvert : rescanner la GALIA.");
     }
+    const attempt = box.activeAttempt!;
     if (!isLeaseHolder(box, actor, input.leaseToken)) {
       throw conflict("NOT_BOX_OWNER", "Cette boîte est contrôlée par une autre session.");
     }
-    const items = await tx.acceptedItem.findMany({ where: { boxId: box.id, voidedAt: null, generation: box.generation }, select: { serial: true, partNumber: true } });
-    const acceptedQty = items.length;
-    if (acceptedQty !== input.observedAcceptedCount) return { kind: "STATE_CHANGED", acceptedCount: acceptedQty };
-
-    const issues: string[] = [];
-    if (acceptedQty < box.expectedQty) issues.push("INCOMPLETE");
-    if (acceptedQty > box.expectedQty) issues.push("OVER_QUANTITY");
-    if (items.some((i) => i.partNumber !== box.partNumber)) issues.push("PART_NUMBER_MISMATCH");
-    if (new Set(items.map((i) => i.serial)).size !== acceptedQty) issues.push("DUPLICATE_SERIAL");
-
-    const reason = input.incompleteReason?.trim() ?? "";
-    if (issues.includes("INCOMPLETE") && reason.length < FINALIZE_REASON_MIN) {
-      return { kind: "REASON_REQUIRED", acceptedCount: acceptedQty, expectedQty: box.expectedQty };
+    if (input.trigger === "GALIA_RESCAN") {
+      const parsed = parseBoxLabel(input.galiaRaw ?? "");
+      if (parsed.kind !== "BOX" || parsed.payload !== box.galiaPayload) {
+        return { kind: "GALIA_MISMATCH", scanned: parsed.kind === "BOX" ? { boxSerial: parsed.boxSerial, partNumber: parsed.partNumber, quantity: parsed.quantity } : null };
+      }
     }
-    const result = issues.length === 0 ? "OK" : "NOK";
+
+    const counts = await attemptCounts(tx, box, attempt.id);
+    if (counts.events !== input.observed.events || counts.reserved !== input.observed.reserved) return { kind: "STATE_CHANGED", counts };
+
+    const issues = issueCodes(counts);
+    const result = isStrictOk(counts) ? "OK" : "NOK";
+    const note = input.note?.trim() ?? "";
     const now = new Date();
-    const attempt = box.activeAttempt;
     const report = await tx.report.create({
       data: {
         boxId: box.id,
@@ -631,10 +801,22 @@ export async function finalizeBox(
         partNumber: box.partNumber,
         galiaPayload: box.galiaPayload,
         expectedQty: box.expectedQty,
-        acceptedQty,
-        difference: acceptedQty - box.expectedQty,
+        acceptedQty: counts.reserved,
+        difference: counts.reserved - box.expectedQty,
         issues,
-        reason: result === "NOK" && reason ? reason.slice(0, 500) : null,
+        countingVersion: 2,
+        distinctQty: counts.distinct,
+        conformingQty: counts.conforming,
+        nonconformingQty: counts.nonconforming,
+        wrongPartNumberQty: counts.wrongPartNumber,
+        otherBoxQty: counts.otherBox,
+        excessQty: counts.excess,
+        extraQty: counts.extra,
+        missingQty: counts.missing,
+        duplicateAttempts: counts.duplicates,
+        invalidAttempts: counts.invalid,
+        endTrigger: input.trigger,
+        reason: result === "NOK" && note ? note.slice(0, 500) : null,
         finalizedById: actor.userId,
         finalizedByUsername: actor.username,
         finalizedAt: now,
@@ -660,7 +842,17 @@ export async function finalizeBox(
       type: "BOX_FINALIZED",
       actor,
       boxId: box.id,
-      details: { reportId: report.id, attemptNumber: attempt.number, attemptKind: attempt.kind, result, acceptedQty, expectedQty: box.expectedQty, issues },
+      details: {
+        reportId: report.id,
+        attemptNumber: attempt.number,
+        attemptKind: attempt.kind,
+        result,
+        trigger: input.trigger,
+        expectedQty: box.expectedQty,
+        acceptedQty: counts.reserved,
+        counts: { ...counts },
+        issues,
+      },
     });
     return { kind: "FINALIZED", report: toReportSummary(report) };
   }, TX_OPTIONS);
@@ -689,7 +881,7 @@ export async function getBoxWorkState(boxId: string): Promise<BoxWorkState> {
       // During an attempt, show the rejections of that attempt only.
       where: { boxId, outcome: { not: "ACCEPTED" }, ...(box.activeAttempt ? { controlAttemptId: box.activeAttempt.id } : {}) },
       orderBy: { createdAt: "desc" },
-      take: 10,
+      take: 20,
       include: { user: { select: { username: true } } },
     }),
   ]);

@@ -16,6 +16,8 @@ export interface ScanJob<R> {
   key: string;
   raw: string;
   seq: number;
+  /** Time the scan was received (ms, Date.now()). */
+  receivedAt: number;
   status: ScanJobStatus;
   attempts: number;
   result?: R;
@@ -30,6 +32,7 @@ export interface ScanQueueOptions<R> {
   onFatal?: (job: ScanJob<R>, error: unknown) => void;
   retryDelayMs?: (attempt: number) => number;
   makeKey?: () => string;
+  now?: () => number;
 }
 
 const defaultDelay = (attempt: number) => Math.min(10_000, 500 * 2 ** Math.min(attempt - 1, 5));
@@ -50,6 +53,7 @@ export class ScanQueue<R> {
       key: (this.opts.makeKey ?? (() => clientUuid()))(),
       raw,
       seq: ++this.seq,
+      receivedAt: (this.opts.now ?? Date.now)(),
       status: "queued",
       attempts: 0,
     };

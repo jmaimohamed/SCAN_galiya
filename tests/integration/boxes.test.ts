@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { prisma } from "@/lib/server/db";
 import { AppError } from "@/lib/server/errors";
-import { finalizeBox, openBox, scanItem, suspendBox } from "@/lib/server/services/boxes";
-import { boxLabel, itemLabel, key, makeActor, newSession, nextSerial, openLeased, PN, resetDb } from "../support/db";
+import { finalizeBox, getBoxSummary, openBox, scanItem, suspendBox } from "@/lib/server/services/boxes";
+import { boxLabel, finishBox, itemLabel, key, makeActor, newSession, nextSerial, openLeased, PN, resetDb } from "../support/db";
 
 let boxSeq = 10_000_000;
 const nextBoxSerial = () => String(++boxSeq);
@@ -31,6 +31,7 @@ describe("opening boxes", () => {
     if (first.kind !== "OPENED") return;
     expect(first.created).toBe(true);
     expect(first.box).toMatchObject({ partNumber: PN, expectedQty: 20, acceptedCount: 0, remaining: 20, status: "IN_PROGRESS", galiaPayload: raw });
+    expect(first.box.counts).toMatchObject({ expected: 20, distinct: 0, conforming: 0, nonconforming: 0, events: 0 });
 
     // Same label again from another tab of the same user: same record, ownership question.
     const tab2 = await newSession(a.userId, a.username, a.role);
@@ -64,60 +65,76 @@ describe("opening boxes", () => {
     const raw = boxLabel(1, nextBoxSerial());
     const { box, leaseToken } = await openLeased(a, raw);
     await fill(a, box.id, leaseToken, 1);
-    await finalizeBox(a, { boxId: box.id, leaseToken, observedAcceptedCount: 1 });
+    await finishBox(a, box.id, leaseToken);
     const r = await openBox(a, { raw });
     expect(r.kind).toBe("FINALIZED");
   });
 });
 
-describe("item acceptance", () => {
-  it("accepts a matching PN and increments only after commit", async () => {
+describe("cover scans (honest counting)", () => {
+  it("counts a matching PN as one conforming piece, reserved only after commit", async () => {
     const a = await makeActor();
     const { box, leaseToken } = await openLeased(a, boxLabel(20, nextBoxSerial()));
     const r = await scanItem(a, { boxId: box.id, leaseToken, raw: "L002815593B96AG_S70166592310", idempotencyKey: key() });
     expect(r.outcome).toBe("ACCEPTED");
-    expect(r.title).toBe("OK — Pièce acceptée");
+    expect(r.title).toBe("OK — Pièce conforme comptée");
     expect(r.item).toMatchObject({ serial: "70166592310", partNumber: PN, acceptedBy: a.username });
     expect(r.box.acceptedCount).toBe(1);
+    expect(r.box.counts).toMatchObject({ distinct: 1, conforming: 1, nonconforming: 0, reserved: 1, events: 1 });
     expect(await prisma.acceptedItem.count({ where: { boxId: box.id } })).toBe(1);
   });
 
-  it("rejects a different PN without incrementing or reserving the serial", async () => {
+  it("records a different PN as a nonconforming observation without reserving the serial", async () => {
     const a = await makeActor();
     const { box, leaseToken } = await openLeased(a, boxLabel(20, nextBoxSerial()));
     const s = nextSerial();
     const r = await scanItem(a, { boxId: box.id, leaseToken, raw: itemLabel(s, "L002815593B96AH"), idempotencyKey: key() });
     expect(r.outcome).toBe("WRONG_PART_NUMBER");
-    expect(r.title).toBe("NON OK — Référence différente");
+    expect(r.title).toBe("RÉFÉRENCE DIFFÉRENTE — pièce non conforme");
     expect(r.expectedPartNumber).toBe(PN);
     expect(r.partNumber).toBe("L002815593B96AH");
     expect(r.box.acceptedCount).toBe(0);
+    expect(r.box.counts).toMatchObject({ distinct: 1, conforming: 0, nonconforming: 1, wrongPartNumber: 1 });
     expect(await prisma.acceptedItem.count()).toBe(0);
+    expect(await prisma.activeSerialReservation.count()).toBe(0);
   });
 
-  it("rejects malformed scans with Format invalide", async () => {
+  it("records malformed scans as invalid attempts that never change the quantity", async () => {
     const a = await makeActor();
     const { box, leaseToken } = await openLeased(a, boxLabel(20, nextBoxSerial()));
+    let last = null;
     for (const raw of ["L002815593B96AG", "70166592310", "L002815593B96AG_S", "junk<script>"]) {
-      const r = await scanItem(a, { boxId: box.id, leaseToken, raw, idempotencyKey: key() });
-      expect(r.outcome).toBe("INVALID_FORMAT");
-      expect(r.title).toBe("Format invalide");
+      last = await scanItem(a, { boxId: box.id, leaseToken, raw, idempotencyKey: key() });
+      expect(last.outcome).toBe("INVALID_FORMAT");
+      expect(last.title).toBe("FORMAT INVALIDE — non compté");
     }
+    expect(last!.box.counts).toMatchObject({ distinct: 0, invalid: 4, events: 4 });
     expect(await prisma.acceptedItem.count()).toBe(0);
     expect(await prisma.scanAttempt.count({ where: { outcome: "INVALID_FORMAT" } })).toBe(4);
   });
 
-  it("detects a duplicate within the same box (new physical scan = new key)", async () => {
+  it("records a second scan of the same cover as a duplicate attempt (quantity unchanged)", async () => {
     const a = await makeActor();
     const { box, leaseToken } = await openLeased(a, boxLabel(20, nextBoxSerial()));
     const [s] = await fill(a, box.id, leaseToken, 1);
     const r = await scanItem(a, { boxId: box.id, leaseToken, raw: itemLabel(s), idempotencyKey: key() });
     expect(r.outcome).toBe("DUPLICATE_SAME_BOX");
-    expect(r.title).toBe("Déjà scannée dans cette boîte");
+    expect(r.title).toBe("SCAN EN DOUBLE — déjà compté");
     expect(r.box.acceptedCount).toBe(1);
+    expect(r.box.counts).toMatchObject({ distinct: 1, conforming: 1, duplicates: 1 });
   });
 
-  it("detects a duplicate from another box with its origin", async () => {
+  it("records a repeated nonconforming cover as a duplicate, not as a second piece", async () => {
+    const a = await makeActor();
+    const { box, leaseToken } = await openLeased(a, boxLabel(5, nextBoxSerial()));
+    const s = nextSerial();
+    await scanItem(a, { boxId: box.id, leaseToken, raw: itemLabel(s, "LOTHERPN1"), idempotencyKey: key() });
+    const again = await scanItem(a, { boxId: box.id, leaseToken, raw: itemLabel(s, "LOTHERPN1"), idempotencyKey: key() });
+    expect(again.outcome).toBe("DUPLICATE_SAME_BOX");
+    expect(again.box.counts).toMatchObject({ distinct: 1, nonconforming: 1, wrongPartNumber: 1, duplicates: 1 });
+  });
+
+  it("records a serial of another box as nonconforming, and the other box keeps it", async () => {
     const a = await makeActor();
     const b = await makeActor();
     const first = await openLeased(a, boxLabel(20, nextBoxSerial()));
@@ -125,29 +142,36 @@ describe("item acceptance", () => {
     const second = await openLeased(b, boxLabel(20, nextBoxSerial()));
     const r = await scanItem(b, { boxId: second.box.id, leaseToken: second.leaseToken, raw: itemLabel(s), idempotencyKey: key() });
     expect(r.outcome).toBe("DUPLICATE_OTHER_BOX");
-    expect(r.title).toBe("Déjà scannée dans une autre boîte");
+    expect(r.title).toBe("SÉRIE DÉJÀ UTILISÉE dans une autre boîte");
     expect(r.duplicate).toMatchObject({ boxSerial: first.box.boxSerial, acceptedBy: a.username });
     expect(r.duplicate?.acceptedAt).toMatch(/^\d{4}-/);
     expect(r.box.acceptedCount).toBe(0);
+    expect(r.box.counts).toMatchObject({ distinct: 1, nonconforming: 1, otherBox: 1 });
+    expect(await prisma.activeSerialReservation.findUniqueOrThrow({ where: { serial: s } })).toMatchObject({ boxId: first.box.id });
   });
 
-  it("refuses items beyond the expected quantity", async () => {
+  it("records matching covers beyond the GALIA quantity as excess, never reserved", async () => {
     const a = await makeActor();
     const { box, leaseToken } = await openLeased(a, boxLabel(2, nextBoxSerial()));
     await fill(a, box.id, leaseToken, 2);
-    const r = await scanItem(a, { boxId: box.id, leaseToken, raw: itemLabel(nextSerial()), idempotencyKey: key() });
-    expect(r.outcome).toBe("QUANTITY_REACHED");
-    expect(r.title).toBe("Quantité prévue déjà atteinte");
+    const s = nextSerial();
+    const r = await scanItem(a, { boxId: box.id, leaseToken, raw: itemLabel(s), idempotencyKey: key() });
+    expect(r.outcome).toBe("EXCESS");
+    expect(r.title).toBe("DÉPASSEMENT — pièce en excédent");
+    expect(r.box.counts).toMatchObject({ expected: 2, distinct: 3, conforming: 3, excess: 1, extra: 1, reserved: 2 });
     expect(await prisma.acceptedItem.count({ where: { boxId: box.id } })).toBe(2);
+    expect(await prisma.activeSerialReservation.findUnique({ where: { serial: s } })).toBeNull();
+    // The control stays open: reaching or exceeding the quantity never finalizes anything.
+    expect(await getBoxSummary(box.id)).toMatchObject({ status: "IN_PROGRESS", latestReport: null });
   });
 
-  it("does not reserve rejected serials: the same serial is accepted later in a correct box", async () => {
+  it("does not reserve excess or wrong-PN serials: the same serial is accepted later in a correct box", async () => {
     const a = await makeActor();
     const full = await openLeased(a, boxLabel(1, nextBoxSerial()));
     await fill(a, full.box.id, full.leaseToken, 1);
     const s = nextSerial();
-    const rejected = await scanItem(a, { boxId: full.box.id, leaseToken: full.leaseToken, raw: itemLabel(s), idempotencyKey: key() });
-    expect(rejected.outcome).toBe("QUANTITY_REACHED");
+    const excess = await scanItem(a, { boxId: full.box.id, leaseToken: full.leaseToken, raw: itemLabel(s), idempotencyKey: key() });
+    expect(excess.outcome).toBe("EXCESS");
     const wrongPn = await openLeased(a, boxLabel(5, nextBoxSerial(), "L000000000X1"));
     const rejected2 = await scanItem(a, { boxId: wrongPn.box.id, leaseToken: wrongPn.leaseToken, raw: itemLabel(s), idempotencyKey: key() });
     expect(rejected2.outcome).toBe("WRONG_PART_NUMBER");
@@ -161,7 +185,7 @@ describe("item acceptance", () => {
     const a = await makeActor();
     const nok = await openLeased(a, boxLabel(3, nextBoxSerial()));
     const [s] = await fill(a, nok.box.id, nok.leaseToken, 1);
-    const fin = await finalizeBox(a, { boxId: nok.box.id, leaseToken: nok.leaseToken, observedAcceptedCount: 1, incompleteReason: "Manque 2 coiffes" });
+    const fin = await finishBox(a, nok.box.id, nok.leaseToken);
     expect(fin.kind === "FINALIZED" && fin.report.result).toBe("NOK");
     const other = await openLeased(a, boxLabel(3, nextBoxSerial()));
     const r = await scanItem(a, { boxId: other.box.id, leaseToken: other.leaseToken, raw: itemLabel(s), idempotencyKey: key() });
@@ -182,6 +206,7 @@ describe("idempotency", () => {
     expect(retry.attemptId).toBe(first.attemptId);
     expect(retry.replayed).toBe(true);
     expect(retry.box.acceptedCount).toBe(1);
+    expect(retry.box.counts).toMatchObject({ distinct: 1, duplicates: 0, events: 1 });
     expect(await prisma.scanAttempt.count()).toBe(1);
   });
 
@@ -227,7 +252,7 @@ describe("concurrency (PostgreSQL row locks + unique constraints)", () => {
     }
   });
 
-  it("never exceeds the quantity when several scans race at 19/20", async () => {
+  it("never reserves beyond the quantity when several scans race at 19/20: the others are recorded excess", async () => {
     const a = await makeActor();
     const { box, leaseToken } = await openLeased(a, boxLabel(20, nextBoxSerial()));
     await fill(a, box.id, leaseToken, 19);
@@ -235,29 +260,32 @@ describe("concurrency (PostgreSQL row locks + unique constraints)", () => {
       Array.from({ length: 6 }, () => scanItem(a, { boxId: box.id, leaseToken, raw: itemLabel(nextSerial()), idempotencyKey: key() })),
     );
     expect(results.filter((r) => r.outcome === "ACCEPTED")).toHaveLength(1);
-    expect(results.filter((r) => r.outcome === "QUANTITY_REACHED")).toHaveLength(5);
+    expect(results.filter((r) => r.outcome === "EXCESS")).toHaveLength(5);
     expect(await prisma.acceptedItem.count({ where: { boxId: box.id } })).toBe(20);
+    expect((await getBoxSummary(box.id)).counts).toMatchObject({ distinct: 25, conforming: 25, excess: 5, extra: 5, reserved: 20 });
   });
 
-  it("keeps finalization consistent when it races with a scan", async () => {
+  it("keeps finalization consistent when it races with a scan (the scan is never silently ignored)", async () => {
     const a = await makeActor();
     for (let round = 0; round < 8; round++) {
       const { box, leaseToken } = await openLeased(a, boxLabel(5, nextBoxSerial()));
       await fill(a, box.id, leaseToken, 4);
+      const seen = await getBoxSummary(box.id);
       const [fin, scan] = await Promise.all([
-        finalizeBox(a, { boxId: box.id, leaseToken, observedAcceptedCount: 4, incompleteReason: "Fin de poste" }),
+        finalizeBox(a, { boxId: box.id, leaseToken, attemptId: seen.activeAttempt!.id, trigger: "GALIA_RESCAN", galiaRaw: seen.galiaPayload, observed: { events: seen.counts.events, reserved: seen.counts.reserved } }),
         scanItem(a, { boxId: box.id, leaseToken, raw: itemLabel(nextSerial()), idempotencyKey: key() }),
       ]);
       const saved = await prisma.box.findUniqueOrThrow({ where: { id: box.id }, include: { reports: true, _count: { select: { items: true } } } });
       if (fin.kind === "FINALIZED") {
-        // Finalize won the lock: the scan was refused and the report matches the stored items.
+        // Finalize won the lock: the scan is recorded as arriving after the end, and the report matches the stored items.
         expect(scan.outcome).toBe("BOX_NOT_IN_PROGRESS");
+        expect(await prisma.scanAttempt.count({ where: { boxId: box.id, outcome: "BOX_NOT_IN_PROGRESS" } })).toBe(1);
         expect(saved.reports).toHaveLength(1);
-        expect(saved.reports[0].acceptedQty).toBe(4);
+        expect(saved.reports[0]).toMatchObject({ acceptedQty: 4, missingQty: 1, result: "NOK" });
         expect(saved._count.items).toBe(4);
         expect(saved.status).toBe("NOK");
       } else {
-        // The scan won: finalization saw a different count and changed nothing.
+        // The scan won: the end request saw other counts and changed nothing.
         expect(fin.kind).toBe("STATE_CHANGED");
         expect(scan.outcome).toBe("ACCEPTED");
         expect(saved.status).toBe("IN_PROGRESS");
@@ -278,9 +306,11 @@ describe("ownership and authorization", () => {
     expect(stolenToken.outcome).toBe("NOT_BOX_OWNER");
     const bogus = await scanItem(intruder, { boxId: box.id, leaseToken: "x".repeat(43), raw: itemLabel(nextSerial()), idempotencyKey: key() });
     expect(bogus.outcome).toBe("NOT_BOX_OWNER");
-    await expect(finalizeBox(intruder, { boxId: box.id, leaseToken, observedAcceptedCount: 0, incompleteReason: "xxx" })).rejects.toMatchObject({ code: "NOT_BOX_OWNER" });
+    await expect(finishBox(intruder, box.id, leaseToken)).rejects.toMatchObject({ code: "NOT_BOX_OWNER" });
     await expect(suspendBox(intruder, { boxId: box.id, leaseToken })).rejects.toBeInstanceOf(AppError);
     expect(await prisma.acceptedItem.count()).toBe(0);
+    // Lease refusals are not part of the control's tally.
+    expect((await getBoxSummary(box.id)).counts.events).toBe(0);
   });
 
   it("allows an audited handover; the previous tab/workstation can no longer write", async () => {
@@ -328,48 +358,71 @@ describe("ownership and authorization", () => {
 });
 
 describe("finalization", () => {
-  it("requires a reason for an incomplete box and then saves NOK with that reason", async () => {
+  it("ends an incomplete box NOT OK with the missing quantity (no reason required; optional note kept)", async () => {
     const a = await makeActor();
     const { box, leaseToken } = await openLeased(a, boxLabel(20, nextBoxSerial()));
     await fill(a, box.id, leaseToken, 18);
-    const noReason = await finalizeBox(a, { boxId: box.id, leaseToken, observedAcceptedCount: 18 });
-    expect(noReason).toEqual({ kind: "REASON_REQUIRED", acceptedCount: 18, expectedQty: 20 });
-    expect((await prisma.box.findUniqueOrThrow({ where: { id: box.id } })).status).toBe("IN_PROGRESS");
-
-    const done = await finalizeBox(a, { boxId: box.id, leaseToken, observedAcceptedCount: 18, incompleteReason: "  Rupture de coiffes  " });
+    const done = await finishBox(a, box.id, leaseToken, { note: "  Rupture de coiffes  " });
     expect(done.kind).toBe("FINALIZED");
     if (done.kind !== "FINALIZED") return;
-    expect(done.report).toMatchObject({ result: "NOK", acceptedQty: 18, expectedQty: 20, difference: -2, issues: ["INCOMPLETE"], reason: "Rupture de coiffes", finalizedBy: a.username });
+    expect(done.report).toMatchObject({ result: "NOK", acceptedQty: 18, expectedQty: 20, difference: -2, issues: ["MISSING"], reason: "Rupture de coiffes", finalizedBy: a.username, countingVersion: 2, endTrigger: "MANUAL" });
+    expect(done.report.counts).toMatchObject({ distinct: 18, conforming: 18, nonconforming: 0, missing: 2, extra: 0 });
+    expect(done.report.lines).toEqual(["MANQUANT : 2 pièces"]);
     expect(done.report.reference).toMatch(/^VR-\d{4}-\d{6}$/);
   });
 
-  it("saves OK only when the accepted quantity equals the GALIA quantity", async () => {
+  it("saves OK only when every rule passes; any recorded mistake makes it NOT OK", async () => {
     const a = await makeActor();
-    const { box, leaseToken } = await openLeased(a, boxLabel(3, nextBoxSerial()));
-    await fill(a, box.id, leaseToken, 3);
-    // A rejected attempt in the log does not prevent OK.
-    await scanItem(a, { boxId: box.id, leaseToken, raw: itemLabel(nextSerial(), "WRONGPN1"), idempotencyKey: key() });
-    const done = await finalizeBox(a, { boxId: box.id, leaseToken, observedAcceptedCount: 3, incompleteReason: "ignored for OK" });
-    expect(done.kind === "FINALIZED" && done.report).toMatchObject({ result: "OK", acceptedQty: 3, difference: 0, issues: [], reason: null });
+    const clean = await openLeased(a, boxLabel(3, nextBoxSerial()));
+    await fill(a, clean.box.id, clean.leaseToken, 3);
+    const ok = await finishBox(a, clean.box.id, clean.leaseToken, { trigger: "GALIA_RESCAN", note: "ignored for OK" });
+    expect(ok.kind === "FINALIZED" && ok.report).toMatchObject({ result: "OK", acceptedQty: 3, difference: 0, issues: [], reason: null, endTrigger: "GALIA_RESCAN", lines: ["CONFORME — Quantité et références vérifiées"] });
+
+    const dirty = await openLeased(a, boxLabel(3, nextBoxSerial()));
+    await fill(a, dirty.box.id, dirty.leaseToken, 3);
+    await scanItem(a, { boxId: dirty.box.id, leaseToken: dirty.leaseToken, raw: itemLabel(nextSerial(), "WRONGPN1"), idempotencyKey: key() });
+    const nok = await finishBox(a, dirty.box.id, dirty.leaseToken, { trigger: "GALIA_RESCAN" });
+    expect(nok.kind === "FINALIZED" && nok.report).toMatchObject({ result: "NOK", acceptedQty: 3, issues: ["EXCESS", "WRONG_PART_NUMBER"] });
   });
 
-  it("refuses to finalize when the operator saw a different count", async () => {
+  it("refuses to finalize when the operator saw different counts", async () => {
     const a = await makeActor();
     const { box, leaseToken } = await openLeased(a, boxLabel(3, nextBoxSerial()));
     await fill(a, box.id, leaseToken, 2);
-    expect(await finalizeBox(a, { boxId: box.id, leaseToken, observedAcceptedCount: 1, incompleteReason: "xyz" })).toEqual({ kind: "STATE_CHANGED", acceptedCount: 2 });
+    const s = await getBoxSummary(box.id);
+    const r = await finalizeBox(a, { boxId: box.id, leaseToken, attemptId: s.activeAttempt!.id, trigger: "MANUAL", observed: { events: 1, reserved: 1 } });
+    expect(r.kind).toBe("STATE_CHANGED");
+    if (r.kind === "STATE_CHANGED") expect(r.counts).toMatchObject({ events: 2, reserved: 2 });
+    expect((await getBoxSummary(box.id)).activeAttempt).not.toBeNull();
   });
 
-  it("makes finalized records immutable (service and database)", async () => {
+  it("only the exact GALIA payload of the box ends it by rescan", async () => {
+    const a = await makeActor();
+    const { box, leaseToken } = await openLeased(a, boxLabel(1, nextBoxSerial()));
+    await fill(a, box.id, leaseToken, 1);
+    const other = await finishBox(a, box.id, leaseToken, { trigger: "GALIA_RESCAN", galiaRaw: boxLabel(1, nextBoxSerial()) });
+    expect(other).toMatchObject({ kind: "GALIA_MISMATCH", scanned: { partNumber: PN, quantity: 1 } });
+    const leadingZero = await finishBox(a, box.id, leaseToken, { trigger: "GALIA_RESCAN", galiaRaw: box.galiaPayload.replace("_Q1_", "_Q01_") });
+    expect(leadingZero.kind).toBe("GALIA_MISMATCH");
+    expect(await prisma.report.count()).toBe(0);
+    expect((await finishBox(a, box.id, leaseToken, { trigger: "GALIA_RESCAN" })).kind).toBe("FINALIZED");
+  });
+
+  it("makes finalized records immutable (service and database); a retried end returns the same report", async () => {
     const a = await makeActor();
     const { box, leaseToken } = await openLeased(a, boxLabel(1, nextBoxSerial()));
     const [s] = await fill(a, box.id, leaseToken, 1);
-    const done = await finalizeBox(a, { boxId: box.id, leaseToken, observedAcceptedCount: 1 });
+    const seen = await getBoxSummary(box.id);
+    const input = { boxId: box.id, leaseToken, attemptId: seen.activeAttempt!.id, trigger: "GALIA_RESCAN" as const, galiaRaw: seen.galiaPayload, observed: { events: 1, reserved: 1 } };
+    const done = await finalizeBox(a, input);
     expect(done.kind).toBe("FINALIZED");
 
     const after = await scanItem(a, { boxId: box.id, leaseToken, raw: itemLabel(nextSerial()), idempotencyKey: key() });
     expect(after.outcome).toBe("BOX_NOT_IN_PROGRESS");
-    expect((await finalizeBox(a, { boxId: box.id, leaseToken, observedAcceptedCount: 1 })).kind).toBe("ALREADY_FINALIZED");
+    const retry = await finalizeBox(a, input);
+    expect(retry.kind).toBe("ALREADY_FINALIZED");
+    if (retry.kind === "ALREADY_FINALIZED" && done.kind === "FINALIZED") expect(retry.report.id).toBe(done.report.id);
+    expect(await prisma.report.count()).toBe(1);
 
     // Direct database writes are refused by the guards.
     await expect(prisma.box.update({ where: { id: box.id }, data: { status: "NOK" } })).rejects.toThrow(/GALIA_GUARD/);
@@ -379,7 +432,7 @@ describe("finalization", () => {
     await expect(prisma.auditEvent.deleteMany({})).rejects.toThrow(/GALIA_GUARD/);
   });
 
-  it("database guard refuses an over-quantity or wrong-PN insert even outside the service", async () => {
+  it("database guard refuses an over-quantity insert even outside the service", async () => {
     const a = await makeActor();
     const { box, leaseToken } = await openLeased(a, boxLabel(1, nextBoxSerial()));
     await fill(a, box.id, leaseToken, 1);

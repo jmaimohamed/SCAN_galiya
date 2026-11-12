@@ -32,18 +32,34 @@ const toneClass: Record<Message["tone"], string> = {
   info: "bg-muted text-foreground border-border",
 };
 
-/** Settings to use in the browser print dialog (shown next to every print action). */
-export function PrintDialogHelp({ widthMm, heightMm }: { widthMm: number; heightMm: number }) {
+/**
+ * Settings to use in the browser print dialog (shown next to every print action).
+ * widthMm × heightMm = the label stock (width across the printhead × length along the feed).
+ */
+export function PrintDialogHelp({ widthMm, heightMm, orientation = "ROTATE_90" }: { widthMm: number; heightMm: number; orientation?: "LANDSCAPE" | "ROTATE_90" | "NONE" }) {
   return (
     <ul className="list-disc pl-5 text-sm" data-testid="print-dialog-help">
       <li>
         Imprimante : la <b>ZD421 de ce poste</b> (pilote Windows ZDesigner).
       </li>
       <li>
-        Papier : <b>{widthMm} × {heightMm} mm</b> (format d&apos;étiquette défini dans le pilote) ; copies : <b>1</b>.
+        Plus de paramètres → Taille du papier : <b>{widthMm} × {heightMm} mm</b> (le format de l&apos;étiquette défini dans le pilote) ; copies : <b>1</b>.
       </li>
       <li>
-        Échelle : <b>100 % / taille réelle</b> (pas « Ajuster ») ; marges : <b>aucune</b>.
+        {orientation === "LANDSCAPE" ? (
+          <>
+            Mise en page : <b>Paysage</b> (choisie automatiquement : la page fait {heightMm} × {widthMm} mm). Le pilote la tourne une fois : ne rien tourner ailleurs.
+          </>
+        ) : (
+          <>
+            Mise en page : <b>Portrait</b>, page {widthMm} × {heightMm} mm comme le rouleau.{" "}
+            {orientation === "ROTATE_90" ? "Le contenu est déjà tourné de 90° par l'application : ne rien tourner ailleurs." : "Contenu imprimé sans rotation."}
+          </>
+        )}
+      </li>
+      <li>
+        Échelle : <b>100 % / taille réelle</b> (jamais « Ajuster » ni une réduction automatique) ; marges : <b>aucune</b>. Si l&apos;aperçu montre l&apos;étiquette réduite dans un
+        coin, la taille du papier choisie n&apos;est pas la bonne.
       </li>
       <li>
         <b>En-têtes et pieds de page : désactivés</b> ; graphiques d&apos;arrière-plan : activés.
@@ -117,11 +133,15 @@ export function PrintPanel({ reportId, blockedReason = null, replacesReference =
         body: { idempotencyKey: pendingKey.current.key, kind, reportId, workstationId, reprintReason },
       });
       pendingKey.current = null;
-      await openLabelPrintDialog(job.id, job.widthMm, job.heightMm);
-      setMessage({
-        tone: "info",
-        text: `Fenêtre d'impression demandée${kind === "REPRINT" ? " (RÉIMPRESSION)" : ""}${replayed ? " (même demande)" : ""}. Vérifier que l'étiquette est bien sortie sur la ZD421 de ce poste : le logiciel ne peut pas le confirmer (une annulation n'est pas détectée).`,
-      });
+      const outcome = await openLabelPrintDialog(job.id, job.widthMm, job.heightMm);
+      setMessage(
+        outcome.likelyShown
+          ? {
+              tone: "info",
+              text: `Fenêtre d'impression demandée${kind === "REPRINT" ? " (RÉIMPRESSION)" : ""}${replayed ? " (même demande)" : ""}. Vérifier que l'étiquette est bien sortie sur la ZD421 de ce poste : le logiciel ne peut pas le confirmer (une annulation n'est pas détectée).`,
+            }
+          : { tone: "warn", text: "La fenêtre d'impression ne semble pas s'être ouverte (bloquée ?). Autoriser l'impression dans le navigateur puis utiliser « Réimprimer… »." },
+      );
     } catch (e) {
       if (e instanceof NetworkError) {
         // The job may or may not exist: keep the same key so a new click cannot create a second job.
@@ -189,7 +209,7 @@ export function PrintPanel({ reportId, blockedReason = null, replacesReference =
               <RefreshCw /> Actualiser
             </Button>
           </div>
-          {profile?.confirmedAt && <PrintDialogHelp widthMm={profile.widthMm} heightMm={profile.heightMm} />}
+          {profile?.confirmedAt && <PrintDialogHelp widthMm={profile.widthMm} heightMm={profile.heightMm} orientation={profile.orientation} />}
         </>
       )}
       <Button variant="ghost" asChild className="self-start">

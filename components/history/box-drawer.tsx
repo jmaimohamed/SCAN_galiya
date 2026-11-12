@@ -77,9 +77,15 @@ export function BoxDrawer({ boxId }: { boxId: string }) {
                 <dd className="font-mono">{detail.partNumber}</dd>
                 <dt className="font-semibold">Série boîte</dt>
                 <dd className="font-mono">{detail.boxSerial}</dd>
-                <dt className="font-semibold">Quantité</dt>
-                <dd className="tabular font-bold">
-                  {detail.acceptedQty} acceptées / {detail.expectedQty} prévues
+                <dt className="font-semibold">Quantités</dt>
+                <dd className="tabular">
+                  <b>
+                    {detail.counts.distinct} pièces distinctes / {detail.expectedQty} attendues
+                  </b>
+                  <div>
+                    {detail.counts.conforming} conformes (dont {detail.acceptedQty} comptées dans la boîte) · {detail.counts.nonconforming} non conformes
+                  </div>
+                  {detail.status !== "OK" && <div className="font-semibold text-nok">{detail.lines.join(" · ")}</div>}
                 </dd>
                 <dt className="font-semibold">Étiquette GALIA</dt>
                 <dd className="break-all font-mono">{detail.galiaPayload}</dd>
@@ -116,14 +122,23 @@ export function BoxDrawer({ boxId }: { boxId: string }) {
                         <dd>
                           <StatusBadge status={a.report.result} />{" "}
                           <span className="tabular font-bold">
-                            {a.report.acceptedQty} / {a.report.expectedQty}
+                            {a.report.counts.distinct} / {a.report.expectedQty}
                           </span>{" "}
-                          (écart {a.report.difference})
+                          — {a.report.counts.conforming} conformes · {a.report.counts.nonconforming} non conformes
+                          {a.report.countingVersion < 2 && <span className="text-xs text-muted-foreground"> (ancien décompte)</span>}
                         </dd>
+                        <dt className="font-semibold">Détail</dt>
+                        <dd className={a.report.result === "OK" ? "text-ok" : "font-semibold text-nok"}>{a.report.lines.join(" · ")}</dd>
                         <dt className="font-semibold">Finalisé par</dt>
                         <dd>
                           <span className="font-mono">{a.report.finalizedBy}</span> — {formatDateTime(a.report.finalizedAt)}
                         </dd>
+                        {a.report.endTrigger && (
+                          <>
+                            <dt className="font-semibold">Fin</dt>
+                            <dd>{a.report.endTrigger === "GALIA_RESCAN" ? "GALIA rescannée" : "Bouton « Terminer le contrôle »"}</dd>
+                          </>
+                        )}
                         {a.report.issues.length > 0 && (
                           <>
                             <dt className="font-semibold">Anomalies</dt>

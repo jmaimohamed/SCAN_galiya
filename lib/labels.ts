@@ -14,17 +14,19 @@ export type ScanOutcomeCode =
   | "DUPLICATE_OTHER_BOX"
   | "QUANTITY_REACHED"
   | "BOX_NOT_IN_PROGRESS"
-  | "NOT_BOX_OWNER";
+  | "NOT_BOX_OWNER"
+  | "EXCESS";
 
 export const OUTCOME_TITLES: Record<ScanOutcomeCode, string> = {
-  ACCEPTED: "OK — Pièce acceptée",
-  INVALID_FORMAT: "Format invalide",
-  WRONG_PART_NUMBER: "NON OK — Référence différente",
-  DUPLICATE_SAME_BOX: "Déjà scannée dans cette boîte",
-  DUPLICATE_OTHER_BOX: "Déjà scannée dans une autre boîte",
-  QUANTITY_REACHED: "Quantité prévue déjà atteinte",
-  BOX_NOT_IN_PROGRESS: "Boîte déjà finalisée",
+  ACCEPTED: "OK — Pièce conforme comptée",
+  INVALID_FORMAT: "FORMAT INVALIDE — non compté",
+  WRONG_PART_NUMBER: "RÉFÉRENCE DIFFÉRENTE — pièce non conforme",
+  DUPLICATE_SAME_BOX: "SCAN EN DOUBLE — déjà compté",
+  DUPLICATE_OTHER_BOX: "SÉRIE DÉJÀ UTILISÉE dans une autre boîte",
+  QUANTITY_REACHED: "Excédent (ancien contrôle)",
+  BOX_NOT_IN_PROGRESS: "Contrôle déjà terminé — scan non compté",
   NOT_BOX_OWNER: "Boîte contrôlée par une autre session",
+  EXCESS: "DÉPASSEMENT — pièce en excédent",
 };
 
 export const STATUS_LABELS: Record<"IN_PROGRESS" | "OK" | "NOK", string> = {
@@ -34,6 +36,14 @@ export const STATUS_LABELS: Record<"IN_PROGRESS" | "OK" | "NOK", string> = {
 };
 
 export const ISSUE_LABELS: Record<string, string> = {
+  // Counting rules v2
+  MISSING: "Manquant",
+  EXCESS: "Excédent",
+  WRONG_PART_NUMBER: "Référence différente",
+  OTHER_BOX_SERIAL: "Série déjà utilisée",
+  DUPLICATE_SCAN: "Scan en double",
+  INVALID_SCAN: "Format invalide",
+  // Legacy reports (rules v1)
   INCOMPLETE: "Quantité incomplète",
   OVER_QUANTITY: "Quantité dépassée",
   PART_NUMBER_MISMATCH: "Référence non conforme",

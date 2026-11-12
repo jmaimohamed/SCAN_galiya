@@ -1,16 +1,37 @@
-﻿/**
- * Called only by an explicit print action, never by an effect or the label page.
- * A same-origin frame avoids popup blockers. The browser still controls printing;
- * print() / afterprint cannot confirm the selected printer or physical output.
+/**
+ * Called only by an explicit action (end of control, print / reprint buttons),
+ * never by an effect or the label page. A hidden same-origin frame avoids popup
+ * blockers. The browser still controls printing; print() / afterprint cannot
+ * confirm the selected printer or the physical output.
+ *
+ * Chrome/Edge keep print() blocked while their print dialog is open, so a call
+ * that returns almost immediately usually means the dialog did not appear
+ * (blocked, or printing disabled): `likelyShown` is false and the page offers a
+ * prominent « Imprimer maintenant » (a heuristic, never a proof either way).
  */
 let current: HTMLIFrameElement | null = null;
 const requested = new Set<string>();
 
-export function openLabelPrintDialog(jobId: string, widthMm: number, heightMm: number): Promise<void> {
-  if (current) return Promise.reject(new Error("Une demande d'impression est déjà en cours."));
-  if (requested.has(jobId)) return Promise.reject(new Error("Fenêtre déjà demandée pour cette étiquette. Vérifier la sortie puis utiliser « Réimprimer… » si nécessaire."));
+/** print() returning faster than this almost certainly did not show a dialog. */
+export const DIALOG_SHOWN_MIN_MS = 250;
 
-  return new Promise((resolve, reject) => {
+export interface PrintDialogOutcome {
+  elapsedMs: number;
+  likelyShown: boolean;
+}
+
+export interface PrintDialogOptions {
+  /** Explicit operator retry of the same job after a blocked / unconfirmed dialog. */
+  allowRepeat?: boolean;
+  now?: () => number;
+}
+
+export function openLabelPrintDialog(jobId: string, widthMm: number, heightMm: number, options: PrintDialogOptions = {}): Promise<PrintDialogOutcome> {
+  if (current) return Promise.reject(new Error("Une demande d'impression est déjà en cours."));
+  if (requested.has(jobId) && !options.allowRepeat) return Promise.reject(new Error("Fenêtre déjà demandée pour cette étiquette. Vérifier la sortie puis utiliser « Réimprimer… » si nécessaire."));
+  const now = options.now ?? (() => performance.now());
+
+  return new Promise<PrintDialogOutcome>((resolve, reject) => {
     const frame = document.createElement("iframe");
     current = frame;
     frame.title = "Impression de l'étiquette";
@@ -55,16 +76,18 @@ export function openLabelPrintDialog(jobId: string, widthMm: number, heightMm: n
         window.clearTimeout(timer);
         requested.add(jobId); // Set BEFORE print(): repeated load events cannot reopen it.
         win.focus();
+        const started = now();
         try {
           win.print();
         } catch {
           throw new Error("Le navigateur a refusé la demande d'impression. Autoriser l'impression, vérifier la sortie puis utiliser « Réimprimer… » si nécessaire.");
         }
+        const elapsedMs = Math.max(0, Math.round(now() - started));
         settled = true;
         // Some browsers render after print() returns. Cleanup never starts a print.
         if (current === frame) current = null;
         window.setTimeout(remove, 60_000);
-        resolve();
+        resolve({ elapsedMs, likelyShown: elapsedMs >= DIALOG_SHOWN_MIN_MS });
       })().catch((e: unknown) => fail(e instanceof Error ? e : new Error("Impression impossible.")));
     };
     frame.src = `/etiquette/${encodeURIComponent(jobId)}`;

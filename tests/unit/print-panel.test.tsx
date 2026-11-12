@@ -17,7 +17,7 @@ beforeEach(() => {
     if (url === "/api/print-jobs") return { job: { id: "job-a", widthMm: 100, heightMm: 100 }, replayed: false };
     return { jobs: [] };
   });
-  printDialog.mockResolvedValue(undefined);
+  printDialog.mockResolvedValue({ elapsedMs: 900, likelyShown: true });
 });
 afterEach(cleanup);
 

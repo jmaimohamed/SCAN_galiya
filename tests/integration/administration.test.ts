@@ -1,3 +1,4 @@
+import { restartNok } from "../support/db";
 import { randomUUID } from "node:crypto";
 import { beforeEach, describe, expect, it } from "vitest";
 import { prisma } from "@/lib/server/db";
@@ -15,7 +16,7 @@ import { GET as detailRoute } from "@/app/api/boxes/[id]/route";
 import { GET as stateRoute } from "@/app/api/boxes/[id]/state/route";
 import { GET as auditLabelRoute } from "@/app/api/admin/print-jobs/[id]/route";
 import { POST as heartbeatRoute } from "@/app/api/presence/route";
-import { boxLabel, ctx, itemLabel, key, makeActor, nextSerial, openLeased, request, resetDb } from "../support/db";
+import { boxLabel, ctx, finishBox, itemLabel, key, makeActor, nextSerial, openLeased, request, resetDb } from "../support/db";
 
 type Actor = Awaited<ReturnType<typeof makeActor>>;
 const reason = "Correction administrative vérifiée";
@@ -33,7 +34,7 @@ async function control(op: Actor, expected = 2, accepted = 1, finalize = true) {
   }
   let reportId: string | null = null;
   if (finalize) {
-    const fin = await finalizeBox(op, { boxId: box.id, leaseToken, observedAcceptedCount: accepted, incompleteReason: "Incomplet" });
+    const fin = await finishBox(op, box.id, leaseToken);
     if (fin.kind !== "FINALIZED") throw new Error(fin.kind);
     reportId = fin.report.id;
   }
@@ -119,7 +120,7 @@ describe("voided scans and reset generations", () => {
     expect(reopened.box).toMatchObject({ id: c.box.id, generation: 2, acceptedCount: 0, needsRecontrol: true });
     expect((await scanItem(op, { boxId: c.box.id, leaseToken: c.leaseToken, raw: itemLabel(nextSerial()), idempotencyKey: key() })).outcome).toBe("NOT_BOX_OWNER");
     await expect(scanItem(op, c.scans[0].input)).rejects.toMatchObject({ code: "CONTROL_INVALIDATED" });
-    await expect(finalizeBox(op, { boxId: c.box.id, leaseToken: c.leaseToken, observedAcceptedCount: 0 })).rejects.toMatchObject({ code: "NOT_BOX_OWNER" });
+    await expect(finishBox(op, c.box.id, c.leaseToken)).rejects.toMatchObject({ code: "NOT_BOX_OWNER" });
     expect((await scanItem(op, { boxId: c.box.id, leaseToken: reopened.leaseToken, raw: itemLabel(c.serials[0]), idempotencyKey: key() })).outcome).toBe("ACCEPTED");
     expect(await prisma.acceptedItem.count({ where: { serial: c.serials[0] } })).toBe(2);
   });
@@ -140,14 +141,19 @@ describe("voided scans and reset generations", () => {
     const item = c.scans[0].result.item!;
     await voidAcceptedItem(admin, { boxId: c.box.id, itemId: item.id, confirmSerial: item.serial, reason });
     expect((await getBoxWorkState(c.box.id)).items).toHaveLength(1);
-    expect(await finalizeBox(op, { boxId: c.box.id, leaseToken: c.leaseToken, observedAcceptedCount: 2 })).toMatchObject({ kind: "STATE_CHANGED", acceptedCount: 1 });
+    const attemptId = (await getBoxSummary(c.box.id)).activeAttempt!.id;
+    // The operator's screen still showed 2 pieces: the end request is refused with the fresh counts.
+    expect(await finalizeBox(op, { boxId: c.box.id, leaseToken: c.leaseToken, attemptId, trigger: "MANUAL", observed: { events: 2, reserved: 2 } })).toMatchObject({ kind: "STATE_CHANGED", counts: { reserved: 1 } });
+    // The released serial is reusable after the authorized removal.
     expect((await scanItem(op, { boxId: c.box.id, leaseToken: c.leaseToken, raw: itemLabel(item.serial), idempotencyKey: key() })).outcome).toBe("ACCEPTED");
-    expect((await finalizeBox(op, { boxId: c.box.id, leaseToken: c.leaseToken, observedAcceptedCount: 2 })).kind).toBe("FINALIZED");
+    const fin = await finishBox(op, c.box.id, c.leaseToken, { trigger: "GALIA_RESCAN" });
+    expect(fin.kind === "FINALIZED" && fin.report).toMatchObject({ result: "OK", acceptedQty: 2 });
   });
 
   it("racing reset/scanning/finalization cannot leave stale ownership, reservations or a valid old report", async () => {
     const admin = await makeActor("ADMIN"); const op = await makeActor(); const c = await control(op, 2, 1, false);
-    await Promise.allSettled([reset(admin, c.box.id), scanItem(op, { boxId: c.box.id, leaseToken: c.leaseToken, raw: itemLabel(nextSerial()), idempotencyKey: key() }), finalizeBox(op, { boxId: c.box.id, leaseToken: c.leaseToken, observedAcceptedCount: 1, incompleteReason: "Incomplet" })]);
+    const seen = await getBoxSummary(c.box.id);
+    await Promise.allSettled([reset(admin, c.box.id), scanItem(op, { boxId: c.box.id, leaseToken: c.leaseToken, raw: itemLabel(nextSerial()), idempotencyKey: key() }), finalizeBox(op, { boxId: c.box.id, leaseToken: c.leaseToken, attemptId: seen.activeAttempt!.id, trigger: "MANUAL", observed: { events: seen.counts.events, reserved: seen.counts.reserved } })]);
     // A concurrent scan may make the confirmation stale. Repeat only after reviewing the fresh state.
     if ((await getBoxSummary(c.box.id)).generation === 1) await reset(admin, c.box.id);
     const b = await prisma.box.findUniqueOrThrow({ where: { id: c.box.id } });
@@ -171,7 +177,8 @@ describe("voided scans and reset generations", () => {
 
   it("void and finalization racing cannot preserve a finalized result with stale contents", async () => {
     const admin = await makeActor("ADMIN"); const op = await makeActor(); const c = await control(op, 1, 1, false); const item = c.scans[0].result.item!;
-    const results = await Promise.allSettled([voidAcceptedItem(admin, { boxId: c.box.id, itemId: item.id, reason, confirmSerial: item.serial }), finalizeBox(op, { boxId: c.box.id, leaseToken: c.leaseToken, observedAcceptedCount: 1 })]);
+    const seen = await getBoxSummary(c.box.id);
+    const results = await Promise.allSettled([voidAcceptedItem(admin, { boxId: c.box.id, itemId: item.id, reason, confirmSerial: item.serial }), finalizeBox(op, { boxId: c.box.id, leaseToken: c.leaseToken, attemptId: seen.activeAttempt!.id, trigger: "GALIA_RESCAN", galiaRaw: seen.galiaPayload, observed: { events: 1, reserved: 1 } })]);
     expect(results[0].status).toBe("fulfilled");
     const b = await getBoxSummary(c.box.id);
     expect(b).toMatchObject({ acceptedCount: 0, needsRecontrol: true, latestReport: null });
@@ -196,18 +203,19 @@ describe("distinct current dashboard counts", () => {
   it("counts current boxes once across corrections and reprints, with reset archives separate", async () => {
     const admin = await makeActor("ADMIN"); const op = await makeActor();
     const a = await control(op, 2, 1); const b = await control(op, 1, 1); await control(op, 2, 0, false);
-    const correction = await openBox(op, { raw: a.raw, startCorrection: true });
+    const correction = await restartNok(op, { raw: a.raw, startCorrection: true });
     if (correction.kind !== "OPENED") throw new Error(correction.kind);
     await scanItem(op, { boxId: a.box.id, leaseToken: correction.leaseToken, raw: itemLabel(nextSerial()), idempotencyKey: key() });
-    const fin = await finalizeBox(op, { boxId: a.box.id, leaseToken: correction.leaseToken, observedAcceptedCount: 2 });
+    await scanItem(op, { boxId: a.box.id, leaseToken: correction.leaseToken, raw: itemLabel(nextSerial()), idempotencyKey: key() });
+    const fin = await finishBox(op, a.box.id, correction.leaseToken);
     if (fin.kind !== "FINALIZED") throw new Error(fin.kind);
     const first = await print(op, fin.report.id);
     const profile = await prisma.printJob.findUniqueOrThrow({ where: { id: first.job.id } });
     await createPrintJob(op, { reportId: fin.report.id, workstationId: profile.workstationId, idempotencyKey: key(), kind: "REPRINT", reprintReason: "Étiquette perdue" });
-    expect((await administrationDashboard(admin, dashboardFilters({}))).metrics).toMatchObject({ completed: 2, ok: 2, nok: 0, inProgress: 1, recontrol: 0, archived: 0 });
+    expect((await administrationDashboard(admin, dashboardFilters({}))).metrics).toMatchObject({ completed: 2, ok: 2, nok: 0, inProgress: 1, recontrol: 0, archived: 1 });
     await reset(admin, b.box.id);
     const dashboard = await administrationDashboard(admin, dashboardFilters({}));
-    expect(dashboard.metrics).toMatchObject({ completed: 1, ok: 1, nok: 0, inProgress: 1, recontrol: 1, archived: 1 });
+    expect(dashboard.metrics).toMatchObject({ completed: 1, ok: 1, nok: 0, inProgress: 1, recontrol: 1, archived: 2 });
     expect(dashboard.total).toBe(3);
     expect((await administrationDashboard(admin, dashboardFilters({ status: "OK", operator: op.username }))).total).toBe(1);
     expect((await administrationDashboard(admin, dashboardFilters({ from: "2099-01-01" }))).total).toBe(0);

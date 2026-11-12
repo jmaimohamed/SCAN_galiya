@@ -8,41 +8,64 @@ function xmlEscape(text: string): string {
 export interface SvgOptions {
   /** Real QR module matrix (server-side); without it a placeholder square is drawn. */
   qrMatrix?: (data: string) => boolean[][];
-  /** Physical size (mm) for printing; omitted = scalable preview with an outline. */
+  /**
+   * Print rendering: the SVG is the PAGE (stock width × length in mm) and the
+   * reading frame is rotated onto it when the layout says so. Omitted = on-screen
+   * preview of the reading frame (not rotated) with an outline.
+   */
   physical?: { widthMm: number; heightMm: number };
+  /** On-screen picture of the printed page (rotated like the print, no mm size). */
+  page?: boolean;
 }
 
 /**
  * SVG rendering of the label layout. With `physical`, the SVG is sized in
- * millimetres and is exactly what the browser prints (black on white). Text is
- * clamped with textLength to the width the layout validated, so browser fonts can
- * never overflow a field. QR codes are drawn module by module (crisp edges).
+ * millimetres and is exactly what the browser prints (black on white, 1 unit =
+ * 1 printer dot at 203 dpi). With ROTATE_90 the landscape content is turned
+ * 90° ONCE here (exact quarter turn: QR modules stay on whole dots); with
+ * LANDSCAPE the page itself is landscape and the Windows driver turns it.
+ * Text is Arial Bold; textLength equals the measured Arial Bold width (so the
+ * glyphs keep their shape) and caps it to the validated box if another font
+ * were substituted.
  */
 export function renderSvg(layout: LabelLayout, options: SvgOptions = {}): string {
-  const size = options.physical ? ` width="${options.physical.widthMm}mm" height="${options.physical.heightMm}mm"` : "";
+  const physical = options.physical;
+  const asPage = !!physical || options.page === true;
+  const rotate = asPage && layout.frame.rotation === 90;
+  const vw = asPage ? layout.pageWidthDots : layout.widthDots;
+  const vh = asPage ? layout.pageHeightDots : layout.heightDots;
+  if (physical && (physical.widthMm !== layout.frame.pageWidthMm || physical.heightMm !== layout.frame.pageHeightMm)) {
+    throw new Error("Taille physique différente de la mise en page.");
+  }
+  const size = physical ? ` width="${physical.widthMm}mm" height="${physical.heightMm}mm"` : "";
   const parts: string[] = [
-    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${layout.widthDots} ${layout.heightDots}"${size} role="img" aria-label="Étiquette" data-template="${layout.template}">`,
-    `<rect x="0" y="0" width="${layout.widthDots}" height="${layout.heightDots}" fill="#fff"${options.physical ? "" : ' stroke="#94a3b8" stroke-width="2"'}/>`,
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${vw} ${vh}"${size} role="img" aria-label="Étiquette" data-template="${layout.template}" data-rotation="${rotate ? 90 : 0}">`,
+    `<rect x="0" y="0" width="${vw}" height="${vh}" fill="#fff"${physical ? "" : ' stroke="#94a3b8" stroke-width="2"'}/>`,
+    // translate(W 0) rotate(90): reading (x, y) → page (W − y, x). Reading left = page top = leading edge.
+    rotate ? `<g transform="translate(${vw} 0) rotate(90)">` : "<g>",
   ];
   for (const el of layout.elements) {
     if (el.type === "rect") {
       if (el.filled) {
-        parts.push(`<rect x="${el.x}" y="${el.y}" width="${el.width}" height="${el.height}" fill="#000"/>`);
+        parts.push(`<rect data-role="${el.role}" x="${el.x}" y="${el.y}" width="${el.width}" height="${el.height}" fill="#000" shape-rendering="crispEdges"/>`);
       } else {
         const t = el.thickness;
-        parts.push(`<rect x="${el.x + t / 2}" y="${el.y + t / 2}" width="${el.width - t}" height="${el.height - t}" fill="none" stroke="#000" stroke-width="${t}"/>`);
+        parts.push(`<rect data-role="${el.role}" x="${el.x + t / 2}" y="${el.y + t / 2}" width="${el.width - t}" height="${el.height - t}" fill="none" stroke="#000" stroke-width="${t}" shape-rendering="crispEdges"/>`);
       }
+    } else if (el.type === "poly") {
+      parts.push(`<polygon data-role="${el.role}" points="${el.points.map(([x, y]) => `${x},${y}`).join(" ")}" fill="#000"/>`);
     } else if (el.type === "text") {
       const shown = layout.accentMode === "ASCII" ? toAsciiVocabulary(el.text) : el.text;
       const anchor = el.align === "L" ? "start" : el.align === "R" ? "end" : "middle";
       const x = el.align === "L" ? el.x : el.align === "R" ? el.x + el.width : el.x + el.width / 2;
       const fit = Math.min(el.width, estimateTextWidth(shown, el.fontHeight));
       parts.push(
-        `<text x="${x}" y="${el.y + el.fontHeight * 0.82}" data-role="${el.role}" font-family="Arial Narrow, Arial, sans-serif" font-weight="700" font-size="${el.fontHeight}" text-anchor="${anchor}" textLength="${fit}" lengthAdjust="spacingAndGlyphs" fill="${el.reverse ? "#fff" : "#000"}">${xmlEscape(shown)}</text>`,
+        `<text x="${x}" y="${Math.round(el.y + el.fontHeight * 0.86)}" data-role="${el.role}" font-family="Arial, Helvetica, sans-serif" font-weight="700" font-size="${el.fontHeight}" text-anchor="${anchor}" textLength="${fit}" lengthAdjust="spacingAndGlyphs" text-rendering="geometricPrecision" fill="${el.reverse ? "#fff" : "#000"}">${xmlEscape(shown)}</text>`,
       );
     } else {
       const matrix = options.qrMatrix?.(el.data);
       if (matrix) {
+        if (matrix.length > el.modules) throw new Error("QR plus grand que la zone réservée.");
         const m = el.magnification;
         let d = "";
         matrix.forEach((row, r) =>
@@ -60,7 +83,7 @@ export function renderSvg(layout: LabelLayout, options: SvgOptions = {}): string
       }
     }
   }
-  parts.push("</svg>");
+  parts.push("</g></svg>");
   return parts.join("");
 }
 

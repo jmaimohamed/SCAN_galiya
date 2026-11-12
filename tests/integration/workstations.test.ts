@@ -5,9 +5,10 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { PUT as putProfileRoute } from "@/app/api/printer-profile/route";
 import { POST as createJobRoute } from "@/app/api/print-jobs/route";
 import { prisma } from "@/lib/server/db";
-import { finalizeBox, scanItem } from "@/lib/server/services/boxes";
-import { confirmPrinterProfile, createPrintJob, getPrinterProfile, savePrinterProfile } from "@/lib/server/services/printing";
-import { boxLabel, itemLabel, key, makeActor, nextSerial, openLeased, request, resetDb } from "../support/db";
+import { scanItem } from "@/lib/server/services/boxes";
+import { confirmPrinterProfile, createPrintJob, getJobLabel, getPrinterProfile, savePrinterProfile } from "@/lib/server/services/printing";
+import { svgQrPath } from "../support/label";
+import { boxLabel, finishBox, itemLabel, key, makeActor, nextSerial, openLeased, request, resetDb } from "../support/db";
 
 type ActorT = Awaited<ReturnType<typeof makeActor>>;
 let boxSeq = 40_000_000;
@@ -26,12 +27,54 @@ async function setup(actor: ActorT, name: string, widthMm = 100, heightMm = 100)
 async function okReport(actor: ActorT) {
   const { box, leaseToken } = await openLeased(actor, boxLabel(1, String(++boxSeq)));
   await scanItem(actor, { boxId: box.id, leaseToken, raw: itemLabel(nextSerial()), idempotencyKey: key() });
-  const fin = await finalizeBox(actor, { boxId: box.id, leaseToken, observedAcceptedCount: 1 });
+  const fin = await finishBox(actor, box.id, leaseToken);
   if (fin.kind !== "FINALIZED") throw new Error(fin.kind);
   return fin.report;
 }
 
 describe("one server, several operator PCs (browser print dialog)", () => {
+  it("stores independent placement per browser, clears confirmation on movement and preserves earlier job snapshots", async () => {
+    const op = await makeActor();
+    const ws = randomUUID(); const other = randomUUID();
+    await savePrinterProfile(op, { workstationId: ws, name: "LONG", widthMm: 110, heightMm: 400, contentLengthMm: 210, contentPosition: "TOP" });
+    await savePrinterProfile(op, { workstationId: other, name: "AUTRE", widthMm: 110, heightMm: 400 });
+    await confirmPrinterProfile(op, { workstationId: ws, labelChecked: true });
+    const report = await okReport(op);
+    const input = { kind: "ORIGINAL" as const, reportId: report.id, workstationId: ws, reprintReason: null };
+    const { job } = await createPrintJob(op, { ...input, idempotencyKey: key() });
+    const old = await prisma.printJob.findUniqueOrThrow({ where: { id: job.id } });
+    const changed = await savePrinterProfile(op, { workstationId: ws, name: "LONG", widthMm: 110, heightMm: 400, contentLengthMm: 210, contentPosition: "BOTTOM" });
+    expect(changed).toMatchObject({ contentPosition: "BOTTOM", contentLengthMm: 210, confirmedAt: null });
+    expect(await getPrinterProfile(other)).toMatchObject({ contentPosition: "CENTER", contentLengthMm: null });
+    await expect(createPrintJob(op, { ...input, idempotencyKey: key(), kind: "REPRINT", reprintReason: "Position changée" })).rejects.toMatchObject({ code: "LABEL_NOT_CONFIRMED" });
+    await confirmPrinterProfile(op, { workstationId: ws, labelChecked: true });
+    const fresh = await createPrintJob(op, { ...input, idempotencyKey: key(), kind: "REPRINT", reprintReason: "Position changée" });
+    const moved = await getJobLabel(fresh.job.id);
+    expect(fresh.job).toMatchObject({ widthMm: 110, heightMm: 400 });
+    expect(svgQrPath(moved.svg!)).not.toBe(svgQrPath(old.payload));
+    expect((await getJobLabel(job.id)).svg).toBe(old.payload);
+    expect(await prisma.printJob.findUniqueOrThrow({ where: { id: job.id } })).toEqual(old);
+    const invalid = await putProfileRoute(request("/api/printer-profile", { method: "PUT", token: op.token, body: { workstationId: ws, name: "INVALIDE", widthMm: 110, heightMm: 400, contentLengthMm: 401, contentPosition: "TOP" } }), {});
+    expect(invalid.status).toBe(400);
+  });
+
+  it("accepts longer real stock through the API and stores a roll-size page without a driver rotation", async () => {
+    const op = await makeActor();
+    const workstationId = randomUUID();
+    const save = await putProfileRoute(request("/api/printer-profile", { method: "PUT", token: op.token, body: { workstationId, name: "ROULEAU-LONG", widthMm: 112, heightMm: 991 } }), {});
+    expect(save.status).toBe(200);
+    expect(await getPrinterProfile(workstationId)).toMatchObject({ widthMm: 112, heightMm: 991, orientation: "ROTATE_90", confirmedAt: null });
+    await confirmPrinterProfile(op, { workstationId, labelChecked: true });
+    const { job } = await createPrintJob(op, { idempotencyKey: key(), kind: "TEST", reportId: null, workstationId, reprintReason: null });
+    expect(job).toMatchObject({ widthMm: 112, heightMm: 991, orientation: "ROTATE_90", status: "DIALOG_REQUESTED" });
+    const stored = await prisma.printJob.findUniqueOrThrow({ where: { id: job.id } });
+    expect(stored.payload).toMatch(/width="112mm" height="991mm"/);
+    expect(stored.payload.match(/rotate\(90\)/g)).toHaveLength(1);
+    for (const dimensions of [{ widthMm: 113, heightMm: 210 }, { widthMm: 110, heightMm: 992 }]) {
+      expect((await putProfileRoute(request("/api/printer-profile", { method: "PUT", token: op.token, body: { workstationId, name: "INVALIDE", ...dimensions } }), {})).status).toBe(400);
+    }
+  });
+
   it("each workstation keeps its own label settings; every job records the PC and size it was printed for", async () => {
     const opA = await makeActor("OPERATOR", "OP_A");
     const opB = await makeActor("OPERATOR", "OP_B");
@@ -40,7 +83,7 @@ describe("one server, several operator PCs (browser print dialog)", () => {
     const jobA = (await createPrintJob(opA, { idempotencyKey: key(), kind: "ORIGINAL", reportId: (await okReport(opA)).id, workstationId: wsA, reprintReason: null })).job;
     const jobB = (await createPrintJob(opB, { idempotencyKey: key(), kind: "ORIGINAL", reportId: (await okReport(opB)).id, workstationId: wsB, reprintReason: null })).job;
     expect(jobA).toMatchObject({ workstationName: "POSTE-A", widthMm: 100, heightMm: 100 });
-    expect(jobB).toMatchObject({ workstationName: "POSTE-B", widthMm: 102, heightMm: 152 });
+    expect(jobB).toMatchObject({ workstationName: "POSTE-B", widthMm: 102, heightMm: 152, orientation: "ROTATE_90" }); // physical page matches the roll
 
     await savePrinterProfile(opB, { workstationId: wsB, name: "POSTE-B", widthMm: 100, heightMm: 150 });
     expect(await getPrinterProfile(wsA)).toMatchObject({ widthMm: 100, heightMm: 100 });

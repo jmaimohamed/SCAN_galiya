@@ -1,6 +1,7 @@
 import "server-only";
 import { z } from "zod";
 import { badRequest } from "./errors";
+import { LABEL_LIMITS } from "@/lib/zpl/layout";
 
 /** Raw scans are bounded here; the barcode parser enforces the real format. */
 const rawScan = z.string().max(512);
@@ -25,8 +26,13 @@ export const openBoxSchema = z
     takeover: z.boolean().optional(),
     /** Explicit "OUI — Corriger" on a closed NOT OK box. */
     startCorrection: z.boolean().optional(),
+    /** Exact report offered to the operator; stale confirmations cannot restart later results. */
+    correctionReportId: uuid.optional(),
+    /** Operator confirms the excess / non-conforming pieces of the NOT OK control were removed. */
+    removalConfirmed: z.boolean().optional(),
   })
-  .refine((v) => (v.raw === undefined) !== (v.boxId === undefined), { message: "raw ou boxId (un seul)" });
+  .refine((v) => (v.raw === undefined) !== (v.boxId === undefined), { message: "raw ou boxId (un seul)" })
+  .refine((v) => !v.startCorrection || !!v.correctionReportId, { message: "Confirmer le rapport NOT OK à recontrôler." });
 
 export const scanSchema = z.object({
   idempotencyKey: uuid,
@@ -36,11 +42,19 @@ export const scanSchema = z.object({
 
 export const suspendSchema = z.object({ leaseToken, reason: z.string().max(40).optional() });
 
-export const finalizeSchema = z.object({
-  leaseToken,
-  observedAcceptedCount: z.number().int().min(0).max(100_000),
-  incompleteReason: z.string().max(500).nullable().optional(),
-});
+export const finalizeSchema = z
+  .object({
+    leaseToken,
+    attemptId: uuid,
+    /** GALIA_RESCAN = the same GALIA was scanned again; MANUAL = « Terminer le contrôle ». */
+    trigger: z.enum(["GALIA_RESCAN", "MANUAL"]),
+    galiaRaw: rawScan.nullable().optional(),
+    observed: z.object({ events: z.number().int().min(0).max(100_000), reserved: z.number().int().min(0).max(100_000) }),
+    note: z.string().max(500).nullable().optional(),
+    /** Workstation of this browser: the automatic print request uses its label settings. */
+    workstationId: uuid.nullable().optional(),
+  })
+  .refine((v) => v.trigger !== "GALIA_RESCAN" || !!v.galiaRaw, { message: "galiaRaw requis pour GALIA_RESCAN" });
 
 export const createPrintJobSchema = z.object({
   idempotencyKey: uuid,
@@ -54,9 +68,14 @@ export const createPrintJobSchema = z.object({
 export const printerProfileSchema = z.object({
   workstationId: uuid,
   name: z.string().trim().min(1).max(64),
-  widthMm: z.number().int().min(50).max(104),
-  heightMm: z.number().int().min(50).max(200),
-});
+  /** Actual stock dimensions; the layout separately respects the printhead width. */
+  widthMm: z.number().int().min(LABEL_LIMITS.widthMinMm).max(LABEL_LIMITS.widthMaxMm),
+  /** Along the feed (label length). */
+  heightMm: z.number().int().min(LABEL_LIMITS.heightMinMm).max(LABEL_LIMITS.heightMaxMm),
+  orientation: z.enum(["LANDSCAPE", "ROTATE_90", "NONE"]).optional(),
+  contentPosition: z.enum(["TOP", "CENTER", "BOTTOM"]).optional(),
+  contentLengthMm: z.number().int().min(LABEL_LIMITS.heightMinMm).max(LABEL_LIMITS.heightMaxMm).nullable().optional(),
+}).refine((v) => v.contentLengthMm == null || v.contentLengthMm <= v.heightMm, { message: "La zone imprimée dépasse la longueur du papier." });
 
 export const confirmProfileSchema = z.object({
   workstationId: uuid,

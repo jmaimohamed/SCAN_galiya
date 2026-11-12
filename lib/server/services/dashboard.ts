@@ -5,6 +5,27 @@ import { assertAdmin } from "../permissions";
 import type { Actor } from "../errors";
 import { plantDayStartUtc } from "@/lib/time";
 import { listPresence, connectedOperatorCount } from "./presence";
+import { computeCounts, countsFromReport, issueLines, type ControlCounts } from "@/lib/counting";
+
+/**
+ * Quantities shown per box: the open attempt's live counts, or the counts saved
+ * on the current report (conforming accepted vs nonconforming / excess).
+ */
+export async function boxRowCounts(boxes: { id: string; expectedQty: number; activeAttemptId: string | null; currentReportId: string | null; _count: { reservations: number } }[]): Promise<Map<string, { counts: ControlCounts; lines: string[] }>> {
+  const attemptIds = boxes.map((b) => b.activeAttemptId).filter((v): v is string => !!v);
+  const reportIds = boxes.filter((b) => !b.activeAttemptId && b.currentReportId).map((b) => b.currentReportId!);
+  const [scans, reports] = await Promise.all([
+    attemptIds.length ? prisma.scanAttempt.findMany({ where: { controlAttemptId: { in: attemptIds } }, select: { controlAttemptId: true, outcome: true, serial: true } }) : [],
+    reportIds.length ? prisma.report.findMany({ where: { id: { in: reportIds } } }) : [],
+  ]);
+  const out = new Map<string, { counts: ControlCounts; lines: string[] }>();
+  for (const b of boxes) {
+    const report = !b.activeAttemptId && b.currentReportId ? reports.find((r) => r.id === b.currentReportId) : undefined;
+    const counts = report ? countsFromReport(report) : computeCounts(b.expectedQty, b._count.reservations, scans.filter((s) => s.controlAttemptId === b.activeAttemptId));
+    out.set(b.id, { counts, lines: issueLines(counts) });
+  }
+  return out;
+}
 
 export const ADMIN_PAGE_SIZE = 25;
 export type DashboardStatus = "ALL" | "COMPLETED" | "OK" | "NOK" | "IN_PROGRESS" | "RECONTROL" | "ARCHIVED";
@@ -53,9 +74,10 @@ export async function administrationDashboard(actor: Actor, f: DashboardFilters)
     f.status === "ARCHIVED" ? [] : prisma.box.findMany({ where, orderBy: [{ generationStartedAt: "desc" }, { id: "asc" }], take: ADMIN_PAGE_SIZE, skip: (page - 1) * ADMIN_PAGE_SIZE, include: { _count: { select: { reservations: true } }, finalizedBy: { select: { username: true } }, activeAttempt: { select: { startedBy: { select: { username: true } } } } } }),
     f.status === "ARCHIVED" ? prisma.controlGeneration.findMany({ where: archiveWhere, orderBy: [{ voidedAt: "desc" }, { id: "asc" }], take: ADMIN_PAGE_SIZE, skip: (page - 1) * ADMIN_PAGE_SIZE }) : [],
   ]);
+  const quantities = await boxRowCounts(boxes);
   return {
     metrics: { completed: counts[0], ok: counts[1], nok: counts[2], inProgress: counts[3], recontrol: counts[4], archived: archivedCount, onlineOperators },
-    rows: boxes.map((b) => ({ id: b.id, serial: b.boxSerial, pn: b.partNumber, generation: b.generation, expectedQty: b.expectedQty, acceptedQty: b._count.reservations, status: b.needsRecontrol ? "RECONTROL" : b.activeAttemptId ? "IN_PROGRESS" : b.status, operator: b.finalizedBy?.username ?? b.activeAttempt?.startedBy.username ?? null, finalizedAt: b.finalizedAt?.toISOString() ?? null })),
+    rows: boxes.map((b) => ({ id: b.id, serial: b.boxSerial, pn: b.partNumber, generation: b.generation, expectedQty: b.expectedQty, acceptedQty: b._count.reservations, counts: quantities.get(b.id)!.counts, lines: quantities.get(b.id)!.lines, status: b.needsRecontrol ? "RECONTROL" : b.activeAttemptId ? "IN_PROGRESS" : b.status, operator: b.finalizedBy?.username ?? b.activeAttempt?.startedBy.username ?? null, finalizedAt: b.finalizedAt?.toISOString() ?? null })),
     archived: archived.map((g) => ({ ...g, startedAt: g.startedAt.toISOString(), voidedAt: g.voidedAt!.toISOString() })),
     presence, total, page, pageCount,
   };

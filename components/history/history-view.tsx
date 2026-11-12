@@ -104,8 +104,13 @@ export function HistoryView({ data, filters, openBoxId }: Props) {
                 <td className="px-3 py-2 tabular">{formatDateTime(r.createdAt)}</td>
                 <td className="px-3 py-2 font-mono font-bold">{r.boxSerial}</td>
                 <td className="px-3 py-2 font-mono">{r.partNumber}</td>
-                <td className="px-3 py-2 tabular font-bold">
-                  {r.acceptedQty} / {r.expectedQty}
+                <td className="px-3 py-2 tabular">
+                  <b>
+                    {r.counts.distinct} / {r.expectedQty}
+                  </b>
+                  <div className="text-xs">
+                    {r.counts.conforming} conf. · {r.counts.nonconforming} non conf.
+                  </div>
                 </td>
                 <td className="px-3 py-2">
                   <span className="flex flex-wrap items-center gap-1">

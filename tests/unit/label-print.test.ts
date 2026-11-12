@@ -96,4 +96,46 @@ describe("explicit browser label printing", () => {
     await expect(openLabelPrintDialog("job-6", 100, 100)).rejects.toThrow(/déjà demandée/);
     expect(print).toHaveBeenCalledOnce();
   });
+
+  it("flags a print() that returns at once as a dialog that probably did not open (blocked)", async () => {
+    let t = 1000;
+    const pending = openLabelPrintDialog("job-7", 100, 150, { now: () => t });
+    const { frame, print } = loadedLabel("job-7");
+    print.mockImplementation(() => {
+      t += 3; // returned immediately: no modal dialog was shown
+    });
+    frame.dispatchEvent(new Event("load"));
+    await expect(pending).resolves.toEqual({ elapsedMs: 3, likelyShown: false });
+  });
+
+  it("reports a dialog that stayed open as likely shown", async () => {
+    let t = 0;
+    const pending = openLabelPrintDialog("job-8", 100, 150, { now: () => t });
+    const { frame, print } = loadedLabel("job-8");
+    print.mockImplementation(() => {
+      t += 4200; // Chrome/Edge block the page while their print dialog is open
+    });
+    frame.dispatchEvent(new Event("load"));
+    await expect(pending).resolves.toEqual({ elapsedMs: 4200, likelyShown: true });
+  });
+
+  it("« Imprimer maintenant » is an explicit retry of the same job; nothing else reopens it", async () => {
+    let t = 0;
+    const first = openLabelPrintDialog("job-9", 100, 150, { now: () => t });
+    const a = loadedLabel("job-9");
+    a.frame.dispatchEvent(new Event("load"));
+    await expect(first).resolves.toMatchObject({ likelyShown: false });
+    await expect(openLabelPrintDialog("job-9", 100, 150)).rejects.toThrow(/déjà demandée/);
+    await vi.advanceTimersByTimeAsync(60_000); // the first frame is cleaned up
+
+    const retry = openLabelPrintDialog("job-9", 100, 150, { allowRepeat: true, now: () => t });
+    const b = loadedLabel("job-9");
+    b.print.mockImplementation(() => {
+      t += 2000;
+    });
+    b.frame.dispatchEvent(new Event("load"));
+    await expect(retry).resolves.toMatchObject({ likelyShown: true });
+    expect(a.print).toHaveBeenCalledOnce();
+    expect(b.print).toHaveBeenCalledOnce();
+  });
 });

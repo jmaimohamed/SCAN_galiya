@@ -3,12 +3,15 @@ import type { Prisma, PrintJob, PrinterProfile, PrintJobType } from "@prisma/cli
 import { qrMatrix } from "../qr";
 import { prisma, TX_OPTIONS } from "../db";
 import { audit } from "../audit";
-import { sha256Hex } from "../crypto";
+import { nameUuid, sha256Hex } from "../crypto";
 import { AppError, badRequest, conflict, notFound, type Actor } from "../errors";
 import { sanitizeDisplayText } from "@/lib/zpl/encode";
-import { LabelLayoutError, TEMPLATE_VERSION, type LabelConfig, type LabelContent } from "@/lib/zpl/layout";
+import { LabelLayoutError, TEMPLATE_VERSION, labelFrame, validateConfig, worstCaseContents, type LabelConfig, type LabelContent, type Orientation, type ContentPosition } from "@/lib/zpl/layout";
+export { worstCaseContents };
 import { renderLabel, renderSvg } from "@/lib/zpl/render";
 import { reportReference } from "@/lib/labels";
+import { countsFromReport, issueLines, isStrictOk } from "@/lib/counting";
+import { formatDateTime } from "@/lib/time";
 import { assertReportAccess } from "../permissions";
 
 /*
@@ -17,6 +20,11 @@ import { assertReportAccess } from "../permissions";
  * the exact SVG snapshot in a print job and serves it on /etiquette/<job>. The
  * operator chooses the printer in the dialog. The job status DIALOG_REQUESTED is
  * final: the software never knows whether a label physically came out.
+ *
+ * Geometry: widthMm = label width across the printhead, heightMm = length along
+ * the feed. LANDSCAPE (legacy): the page is heightMm × widthMm landscape and the
+ * Windows driver turns it once onto the roll. ROTATE_90: portrait page, content
+ * turned once inside the SVG (default, page matches the roll). NONE: portrait page and content.
  */
 
 /** Layout units per millimetre (geometry only; the physical size is set in mm). */
@@ -33,6 +41,7 @@ export interface PrintJobDto {
   workstationName: string | null;
   widthMm: number;
   heightMm: number;
+  orientation: Orientation | null;
   templateVersion: string;
   payloadSha256: string;
   reprintReason: string | null;
@@ -52,6 +61,7 @@ export function toJobDto(j: PrintJob): PrintJobDto {
     workstationName: j.workstationName,
     widthMm: j.widthMm,
     heightMm: j.heightMm,
+    orientation: j.orientation === "LANDSCAPE" || j.orientation === "ROTATE_90" || j.orientation === "NONE" ? j.orientation : null,
     templateVersion: j.templateVersion,
     payloadSha256: j.payloadSha256,
     reprintReason: j.reprintReason,
@@ -65,11 +75,20 @@ export function toJobDto(j: PrintJob): PrintJobDto {
 export interface PrinterProfileDto {
   workstationId: string;
   name: string;
+  /** Across the printhead. */
   widthMm: number;
+  /** Along the feed. */
   heightMm: number;
+  orientation: Orientation;
+  contentPosition: ContentPosition;
+  contentLengthMm: number | null;
   confirmedAt: string | null;
   confirmedBy: string | null;
   updatedAt: string;
+}
+
+function toOrientation(value: string | null | undefined): Orientation {
+  return value === "NONE" || value === "LANDSCAPE" ? value : "ROTATE_90";
 }
 
 async function toProfileDto(p: PrinterProfile): Promise<PrinterProfileDto> {
@@ -79,6 +98,9 @@ async function toProfileDto(p: PrinterProfile): Promise<PrinterProfileDto> {
     name: p.name,
     widthMm: p.widthMm,
     heightMm: p.heightMm,
+    orientation: toOrientation(p.orientation),
+    contentPosition: p.contentPosition as ContentPosition,
+    contentLengthMm: p.contentLengthMm,
     confirmedAt: p.confirmedAt?.toISOString() ?? null,
     confirmedBy: confirmer?.username ?? null,
     updatedAt: p.updatedAt.toISOString(),
@@ -95,16 +117,26 @@ export interface ProfileInput {
   name: string;
   widthMm: number;
   heightMm: number;
+  orientation?: Orientation;
+  contentPosition?: ContentPosition;
+  contentLengthMm?: number | null;
 }
 
-/** Save this workstation's label settings. A size change clears the confirmation. */
+/** Save this workstation's label settings. A size or orientation change clears the confirmation. */
 export async function savePrinterProfile(actor: Actor, input: ProfileInput): Promise<PrinterProfileDto> {
   const before = await prisma.printerProfile.findUnique({ where: { workstationId: input.workstationId } });
-  const changed = !before || before.widthMm !== input.widthMm || before.heightMm !== input.heightMm;
+  const orientation = input.orientation ?? toOrientation(before?.orientation);
+  const contentPosition = input.contentPosition ?? (before?.contentPosition as ContentPosition | undefined) ?? "CENTER";
+  const contentLengthMm = input.contentLengthMm === undefined ? before?.contentLengthMm ?? null : input.contentLengthMm;
+  try { validateConfig({ widthMm: input.widthMm, heightMm: input.heightMm, orientation, contentPosition, contentLengthMm, dpi: LABEL_UNITS_DPI, accentMode: "UTF8" }); } catch (e) { layoutErrorToApp(e); }
+  const changed = !before || before.widthMm !== input.widthMm || before.heightMm !== input.heightMm || toOrientation(before.orientation) !== orientation || before.contentPosition !== contentPosition || before.contentLengthMm !== contentLengthMm;
   const data = {
     name: input.name,
     widthMm: input.widthMm,
     heightMm: input.heightMm,
+    orientation,
+    contentPosition,
+    contentLengthMm,
     accentMode: "UTF8",
     updatedById: actor.userId,
     ...(changed ? { confirmedAt: null, confirmedById: null } : {}),
@@ -117,26 +149,13 @@ export async function savePrinterProfile(actor: Actor, input: ProfileInput): Pro
   await audit(prisma, {
     type: "LABEL_SETTINGS_SAVED",
     actor,
-    details: { workstationId: input.workstationId, name: input.name, widthMm: input.widthMm, heightMm: input.heightMm, confirmationCleared: changed },
+    details: { workstationId: input.workstationId, name: input.name, widthMm: input.widthMm, heightMm: input.heightMm, orientation, contentPosition, contentLengthMm, confirmationCleared: changed },
   });
   return toProfileDto(saved);
 }
 
-function labelConfig(p: Pick<PrinterProfile, "widthMm" | "heightMm">): LabelConfig {
-  return { widthMm: p.widthMm, heightMm: p.heightMm, dpi: LABEL_UNITS_DPI, accentMode: "UTF8" };
-}
-
-/** Worst-case content used to prove the configured stock can hold every label. */
-function worstCaseContents(): LabelContent[] {
-  const pn = "L".padEnd(40, "8");
-  const op = "W".repeat(32);
-  const serial = "9".repeat(30);
-  const payload = `P${pn}_Q999_S${serial}`;
-  return [
-    { template: "OK", operator: op, partNumber: pn, quantity: 999, boxSerial: serial, galiaPayload: payload, reprint: true },
-    { template: "NOT_OK", operator: op, partNumber: pn, qtyFound: 999, reprint: true },
-    { template: "TEST", operator: op, workstationName: "Z".repeat(60) },
-  ];
+function labelConfig(p: Pick<PrinterProfile, "widthMm" | "heightMm" | "orientation" | "contentPosition" | "contentLengthMm">): LabelConfig {
+  return { widthMm: p.widthMm, heightMm: p.heightMm, dpi: LABEL_UNITS_DPI, accentMode: "UTF8", orientation: toOrientation(p.orientation), contentPosition: p.contentPosition as ContentPosition, contentLengthMm: p.contentLengthMm };
 }
 
 function layoutErrorToApp(e: unknown): never {
@@ -155,7 +174,7 @@ export async function confirmPrinterProfile(actor: Actor, input: { workstationId
     layoutErrorToApp(e);
   }
   const saved = await prisma.printerProfile.update({ where: { workstationId: p.workstationId }, data: { confirmedAt: new Date(), confirmedById: actor.userId } });
-  await audit(prisma, { type: "LABEL_SETTINGS_CONFIRMED", actor, details: { workstationId: p.workstationId, name: p.name, widthMm: p.widthMm, heightMm: p.heightMm } });
+  await audit(prisma, { type: "LABEL_SETTINGS_CONFIRMED", actor, details: { workstationId: p.workstationId, name: p.name, widthMm: p.widthMm, heightMm: p.heightMm, orientation: toOrientation(p.orientation), contentPosition: p.contentPosition, contentLengthMm: p.contentLengthMm, templateVersion: TEMPLATE_VERSION } });
   return toProfileDto(saved);
 }
 
@@ -164,6 +183,7 @@ export async function confirmPrinterProfile(actor: Actor, input: { workstationId
 type ReportForLabel = {
   result: "IN_PROGRESS" | "OK" | "NOK";
   finalizedByUsername: string;
+  finalizedAt: Date;
   partNumber: string;
   boxSerial: string;
   galiaPayload: string;
@@ -171,43 +191,44 @@ type ReportForLabel = {
   acceptedQty: number;
   difference: number;
   issues: string[];
+  countingVersion: number;
+  excessQty: number;
+  wrongPartNumberQty: number;
+  otherBoxQty: number;
+  duplicateAttempts: number;
+  invalidAttempts: number;
 };
 
 /**
- * Label content from ONE saved, immutable report. OK labels exist only when the
- * server-computed result is OK and the accepted count equals the GALIA quantity.
+ * Label content from ONE saved, immutable report: every number and line comes
+ * from the report snapshot. OK labels exist only when the saved result is OK AND
+ * the saved counts are strictly OK; the QR then holds the exact GALIA payload.
  */
 export function labelContentFromReport(report: ReportForLabel, reprint: boolean): LabelContent {
+  const counts = countsFromReport(report);
+  const figures = { expected: counts.expected, distinct: counts.distinct, conforming: counts.conforming, nonconforming: counts.nonconforming, lines: issueLines(counts) };
+  const base = { operator: report.finalizedByUsername, partNumber: report.partNumber, boxSerial: report.boxSerial, figures, finalizedAt: formatDateTime(report.finalizedAt), reprint };
   if (report.result === "OK") {
-    if (report.acceptedQty !== report.expectedQty || report.issues.length > 0) {
+    if (!isStrictOk(counts) || report.issues.length > 0) {
       throw new AppError(500, "REPORT_INCONSISTENT", "Rapport incohérent : impression refusée.");
     }
-    return {
-      template: "OK",
-      operator: report.finalizedByUsername,
-      partNumber: report.partNumber,
-      quantity: report.expectedQty,
-      boxSerial: report.boxSerial,
-      galiaPayload: report.galiaPayload,
-      reprint,
-    };
+    return { template: "OK", ...base, galiaPayload: report.galiaPayload };
   }
-  if (report.result === "NOK") {
-    return { template: "NOT_OK", operator: report.finalizedByUsername, partNumber: report.partNumber, qtyFound: report.acceptedQty, reprint };
-  }
+  if (report.result === "NOK") return { template: "NOT_OK", ...base };
   throw conflict("BOX_NOT_FINALIZED", "Boîte non finalisée : aucune étiquette possible.");
 }
 
 /** Physical-size SVG of a label (real QR on OK labels). */
 function renderPhysicalSvg(content: LabelContent, cfg: LabelConfig): string {
   try {
-    return renderLabel(content, cfg, { qrMatrix, physical: { widthMm: cfg.widthMm, heightMm: cfg.heightMm } }).svg;
+    const frame = labelFrame(cfg);
+    return renderLabel(content, cfg, { qrMatrix, physical: { widthMm: frame.pageWidthMm, heightMm: frame.pageHeightMm } }).svg;
   } catch (e) {
     layoutErrorToApp(e);
   }
 }
 
-/** On-screen preview of a report label for this workstation's label size. */
+/** On-screen preview of a report label for this workstation's label size (reading orientation). */
 export async function previewReportLabel(reportId: string, workstationId: string): Promise<{ svg: string; warning: string | null }> {
   const [report, profile] = await Promise.all([
     prisma.report.findUnique({ where: { id: reportId } }),
@@ -223,13 +244,16 @@ export async function previewReportLabel(reportId: string, workstationId: string
   }
 }
 
-/** On-screen preview of the TEST label. */
-export async function previewTestLabel(actor: Actor, workstationId: string): Promise<{ svg: string }> {
+/**
+ * On-screen previews of the TEST label: `svg` in reading orientation, `pageSvg`
+ * as it lies on the stock coming out of the printer (rotated when ROTATE_90).
+ */
+export async function previewTestLabel(actor: Actor, workstationId: string): Promise<{ svg: string; pageSvg: string; fitScale: number }> {
   const profile = await prisma.printerProfile.findUnique({ where: { workstationId } });
   if (!profile) throw notFound("Aucun réglage d'étiquette pour ce poste.");
   try {
     const { layout } = renderLabel({ template: "TEST", operator: actor.username, workstationName: sanitizeDisplayText(profile.name) }, labelConfig(profile));
-    return { svg: renderSvg(layout, { qrMatrix }) };
+    return { svg: renderSvg(layout, { qrMatrix }), pageSvg: renderSvg(layout, { qrMatrix, page: true }), fitScale: layout.fitScale };
   } catch (e) {
     layoutErrorToApp(e);
   }
@@ -343,8 +367,10 @@ export async function createPrintJob(actor: Actor, input: CreatePrintJobInput): 
           printerName: null,
           printerUid: null,
           dpi: null,
-          widthMm: cfg.widthMm,
-          heightMm: cfg.heightMm,
+          // The printed PAGE (LANDSCAPE: length × width); the stock is in the workstation profile.
+          widthMm: labelFrame(cfg).pageWidthMm,
+          heightMm: labelFrame(cfg).pageHeightMm,
+          orientation: labelFrame(cfg).orientation,
           accentMode: cfg.accentMode,
           templateVersion: TEMPLATE_VERSION,
           reprintReason: input.kind === "REPRINT" ? input.reprintReason!.trim().slice(0, 200) : null,
@@ -369,6 +395,27 @@ export async function createPrintJob(actor: Actor, input: CreatePrintJobInput): 
       return { job: toJobDto(raced), replayed: true };
     }
     throw e;
+  }
+}
+
+export type AutoPrint =
+  | { status: "REQUESTED"; job: PrintJobDto; replayed: boolean }
+  | { status: "BLOCKED"; code: string; message: string };
+
+/**
+ * The automatic print request made when a control ends: one ORIGINAL job per
+ * report, keyed by the report id, so a retried or repeated end request returns
+ * the same job (never a second label). Failures never touch the finalized report.
+ */
+export async function requestAutomaticPrint(actor: Actor, reportId: string, workstationId: string | null | undefined): Promise<AutoPrint> {
+  if (!workstationId) return { status: "BLOCKED", code: "NO_WORKSTATION", message: "Poste non identifié (stockage du navigateur indisponible) : étiquette non préparée." };
+  try {
+    const { job, replayed } = await createPrintJob(actor, { idempotencyKey: nameUuid(`auto-print:${reportId}`), kind: "ORIGINAL", reportId, workstationId, reprintReason: null });
+    return { status: "REQUESTED", job, replayed };
+  } catch (e) {
+    if (e instanceof AppError) return { status: "BLOCKED", code: e.code, message: e.message };
+    console.error("automatic print request failed", e instanceof Error ? e.message : e);
+    return { status: "BLOCKED", code: "PRINT_ERROR", message: "Étiquette non préparée (erreur interne). Le rapport est enregistré : utiliser « Imprimer l'étiquette »." };
   }
 }
 

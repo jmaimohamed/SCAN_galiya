@@ -42,7 +42,7 @@ export default async function ReportPage({ params }: { params: Promise<{ id: str
         <div className="mt-4 border-4 border-black p-3 text-center text-2xl font-black">RAPPORT REMPLACÉ PAR {supersededBy} — NE PAS UTILISER COMME RÉSULTAT ACTUEL</div>
       )}
       <div className={`my-8 rounded-lg border-[10px] p-8 text-center ${ok ? "border-black bg-[#15803d] text-white" : "border-double border-black bg-[#b91c1c] text-white"}`}>
-        <div className="text-[110px] font-black leading-none">{ok ? "✔ OK" : "✖ NON OK"}</div>
+        <div className="text-[110px] font-black leading-none">{ok ? "✔ OK" : "✖ NOT OK"}</div>
       </div>
       <table className="w-full border-collapse text-xl">
         <tbody>
@@ -50,12 +50,19 @@ export default async function ReportPage({ params }: { params: Promise<{ id: str
             ["Tentative", r.kind === "CORRECTION" ? `Correction n°${r.attemptNumber}` : "Contrôle initial (n°1)"],
             ["Série boîte", r.boxSerial],
             ["Référence (PN)", r.partNumber],
-            ["Quantité prévue", String(r.expectedQty)],
-            ["Quantité acceptée", String(r.acceptedQty)],
-            ["Écart", String(r.difference)],
-            ["Finalisé le (Africa/Tunis)", formatDateTime(r.finalizedAt)],
+            ["Quantité attendue", String(r.expectedQty)],
+            ["Pièces distinctes scannées", String(r.counts.distinct)],
+            ["Quantité conforme", String(r.counts.conforming)],
+            ["Non conformes", String(r.counts.nonconforming)],
+            ...(r.counts.missing > 0 ? [["Manquant", String(r.counts.missing)]] : []),
+            ...(Math.max(r.counts.extra, r.counts.excess) > 0 ? [["Excédent", String(Math.max(r.counts.extra, r.counts.excess))]] : []),
+            ...(r.counts.duplicates > 0 ? [["Scans en double (tentatives)", String(r.counts.duplicates)]] : []),
+            ...(r.counts.invalid > 0 ? [["Formats invalides (tentatives)", String(r.counts.invalid)]] : []),
+            ["Conclusion", r.lines.join(" · ")],
+            ["Terminé le (Africa/Tunis)", formatDateTime(r.finalizedAt)],
             ["Référence du rapport", r.reference],
-            ...(!ok ? [["Motif / anomalies", [r.issues.map((i) => ISSUE_LABELS[i] ?? i).join(", "), r.reason].filter(Boolean).join(" — ")]] : []),
+            ...(r.countingVersion < 2 ? [["Décompte", "Ancien rapport : seules les coiffes acceptées étaient enregistrées"]] : []),
+            ...(!ok && (r.issues.length > 0 || r.reason) ? [["Anomalies / note", [r.issues.map((i) => ISSUE_LABELS[i] ?? i).join(", "), r.reason].filter(Boolean).join(" — ")]] : []),
           ].map(([k, v]) => (
             <tr key={k} className="border-b-2 border-black">
               <th className="w-1/3 py-2 pr-4 text-left">{k}</th>
